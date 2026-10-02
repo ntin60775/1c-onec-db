@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "1c-onec-db"
+version = "0.1.0"
+description = "pytest-фикстуры для тестов уровня логики 1С: тонкий MCP-клиент 1c-db (execute_code/query) + HTTP-заглушка внешних систем. Контур 1c-zcode."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Valera Kovalskii" }]
+keywords = ["1c", "pytest", "mcp", "onec-db", "testing", "fixtures"]
+classifiers = [
+    "Framework :: Pytest",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = []  # только stdlib
+
+[project.entry-points.pytest11]
+onec_db = "onec_db.plugin"
+
+[tool.setuptools.packages.find]
+where = ["src"]
