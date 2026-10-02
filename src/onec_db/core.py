@@ -116,14 +116,14 @@ class OnecDB:
 			raise RuntimeError("execute_code: код не установил переменную `Результат`")
 		# сериализатор тулкита отдаёт значение строкой: 1С-строка — JSON-литералом
 		# ('"e74e-…"'), коллекции — JSON ('[{…}]'), числа — строкой («4»);
-		# распаковываем валидный JSON, прочее — как есть
-		if isinstance(payload, str) and payload.strip()[:1] in ('"', "{", "[", "-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
-			try:
-				parsed = json.loads(payload)
-			except (json.JSONDecodeError, ValueError):
-				parsed = None
-			if parsed is not None and not isinstance(parsed, str):
-				payload = parsed
+		# разворачиваем валидный JSON-литерал, не-JSON — как есть
+		if isinstance(payload, str):
+			stripped = payload.strip()
+			if stripped[:1] in ('"', "{", "[", "-", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "t", "f", "n"):
+				try:
+					payload = json.loads(payload)
+				except (json.JSONDecodeError, ValueError):
+					pass
 		return payload
 
 	def execute_json(self, code: str):

@@ -76,8 +76,8 @@ class FakeMCPHandler(BaseHTTPRequestHandler):
 		elif body.get("method") == "tools/call":
 			code = body["params"]["arguments"]["code"]
 			if "ЗаписатьJSON" in code:
-				# 1С-строка с JSON-текстом: data приходит строкой
-				inner = '{"sum": 42}'
+				# 1С-строка с JSON-текстом: сериализатор отдаёт JSON-литералом
+				inner = json.dumps('{"sum": 42}')
 			elif code == "Результат = 4;":
 				# число 1С: сериализатор отдаёт строковым представлением «4»
 				inner = "4"

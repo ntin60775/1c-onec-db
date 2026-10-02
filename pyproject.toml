@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "1c-onec-db"
-version = "0.1.2"
+version = "0.1.3"
 description = "pytest-фикстуры для тестов уровня логики 1С: тонкий MCP-клиент 1c-db (execute_code/query) + HTTP-заглушка внешних систем. Контур 1c-zcode."
 readme = "README.md"
 license = "MIT"
