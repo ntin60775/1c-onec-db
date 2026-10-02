@@ -33,7 +33,7 @@ def _resolve_url() -> str:
 
 
 @pytest.fixture(scope="session")
-def onec_db():
+def onec_db() -> OnecDB:
 	try:
 		client = OnecDB(_resolve_url())
 		client.execute("Результат = Истина;")

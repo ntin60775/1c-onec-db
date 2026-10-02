@@ -76,11 +76,11 @@ class FakeMCPHandler(BaseHTTPRequestHandler):
 		elif body.get("method") == "tools/call":
 			code = body["params"]["arguments"]["code"]
 			if "ЗаписатьJSON" in code:
-				# строковое 1С-значение: сериализатор отдаёт JSON-литералом
-				inner = json.dumps('{"sum": 42}')
+				# 1С-строка с JSON-текстом: data приходит строкой
+				inner = '{"sum": 42}'
 			elif code == "Результат = 4;":
 				# число 1С: сериализатор отдаёт строковым представлением «4»
-				inner = json.dumps("4")
+				inner = "4"
 			else:
 				# коллекция: сериализатор отдаёт целиком как JSON
 				inner = json.dumps({"echo": code})
@@ -122,9 +122,7 @@ def test_numeric_string_unwraps_to_number(fake_mcp):
 
 def test_execute_json(fake_mcp):
 	db = OnecDB(fake_mcp)
-	# строка (ЗаписатьJSON) приходит JSON-литералом → execute вернёт чистую строку
-	raw = db.execute('Результат = ЗаписатьJSON(Запись, Объект);')
-	assert raw == '{"sum": 42}'
+	# execute распаковывает валидный JSON сам; execute_json принимает оба вида
 	assert db.execute_json('Результат = ЗаписатьJSON(Запись, Объект);') == {"sum": 42}
 
 

@@ -127,8 +127,14 @@ class OnecDB:
 		return payload
 
 	def execute_json(self, code: str):
-		"""BSL обязан установить `Результат` JSON-строкой; вернуть python-объект."""
-		return json.loads(self.execute(code))
+		"""BSL устанавливает `Результат` через ЗаписатьJSON; вернуть python-объект.
+
+		принимает и строку-JSON, и уже распакованное execute'ом значение.
+		"""
+		payload = self.execute(code)
+		if isinstance(payload, str):
+			return json.loads(payload)
+		return payload
 
 	def query(self, text: str, limit: int = 100):
 		"""Выполнить запрос; вернуть {"success", "data": [строки]}."""
