@@ -20,6 +20,51 @@ def test_unwrap_toolkit_envelope():
 	assert CoreDB._unwrap({"success": True}) == {"success": True}
 
 
+# ── парсер таблицы тулкита v1.10+ (execute_query текстом) ──
+
+def test_parse_table_basic_types():
+	table = ('[2]{"Наименование","ИНН"}:\n'
+	         '  "[ORG-00001]",""\n'
+	         '  "[ORG-00002]","7700000000"')
+	assert CoreDB._parse_table(table) == [
+		{"Наименование": "[ORG-00001]", "ИНН": ""},
+		{"Наименование": "[ORG-00002]", "ИНН": "7700000000"},
+	]
+
+
+def test_parse_table_unquoted_numbers_and_nulls():
+	table = '[2]{"Сумма","Комментарий"}:\n  42,null\n  10.5,"текст"'
+	assert CoreDB._parse_table(table) == [
+		{"Сумма": 42, "Комментарий": None},
+		{"Сумма": 10.5, "Комментарий": "текст"},
+	]
+
+
+def test_parse_table_quotes_with_commas_and_newlines():
+	# значение содержит запятую, удвоенные кавычки и перевод строки (ЖР)
+	table = '[1]{"Дата","Комментарий"}:\n  "2026-11-02T21:33:47","Ошибка, да ""внутри""\nвторая строка"'
+	assert CoreDB._parse_table(table) == [{
+		"Дата": "2026-11-02T21:33:47",
+		"Комментарий": 'Ошибка, да "внутри"\nвторая строка',
+	}]
+
+
+def test_parse_table_empty_and_crlf():
+	assert CoreDB._parse_table('[0]{"Код"}:') == []
+	table = '[1]{"Код","Имя"}:\r\n  "00-1","А"\r\n'
+	assert CoreDB._parse_table(table) == [{"Код": "00-1", "Имя": "А"}]
+
+
+def test_parse_table_not_a_table_returns_none():
+	assert CoreDB._parse_table('внутренняя ошибка тулкита') is None
+	assert CoreDB._parse_table('') is None
+
+
+def test_parse_table_pads_short_rows():
+	table = '[1]{"А","Б","В"}:\n  1,"два"'
+	assert CoreDB._parse_table(table) == [{"А": 1, "Б": "два", "В": None}]
+
+
 def test_create_object_rejects_non_identifier():
 	db = OnecDB.__new__(OnecDB)  # без соединения
 	with pytest.raises(ValueError):

@@ -5,6 +5,7 @@
 фикстуры уровня логики предназначены только для тестовых деревьев.
 """
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -137,14 +138,121 @@ class OnecDB:
 		return payload
 
 	def query(self, text: str, limit: int = 100):
-		"""Выполнить запрос; вернуть {"success", "data": [строки]}."""
+		"""Выполнить запрос; вернуть {"success", "data": [строки]}.
+
+		Тулкит v1.10+ отдаёт таблицу текстом (`[N]{"колонки"}: строки`) —
+		парсится на месте; JSON-строка старых тулкитов парсится как раньше.
+		"""
 		data = self._unwrap(self._call("execute_query", {"query": text, "limit": limit}))
 		if isinstance(data, dict) and isinstance(data.get("data"), str):
+			raw = data["data"]
 			try:
-				data = {**data, "data": json.loads(data["data"])}
+				parsed = json.loads(raw)
 			except json.JSONDecodeError:
-				pass
+				parsed = self._parse_table(raw)
+			if parsed is not None:
+				data = {**data, "data": parsed}
 		return data
+
+	@staticmethod
+	def _parse_table(text: str):
+		"""Таблица тулкита v1.10+ → список словарей; не таблица → None.
+
+		Формат: заголовок `[N]{"кол1","кол2"}:`, далее записи — поля через
+		запятую, строки в кавычках (экранирование удвоением), числа/булевы/
+		null — без кавычек. Кавычки могут содержать запятые и переводы строк.
+		"""
+		text = text.lstrip()
+		header = re.match(r"\[(\d+)\]\{(.*?)\}:\s*$", text.split("\n", 1)[0].rstrip("\r"))
+		if header is None:
+			return None
+		raw_cols = OnecDB._split_fields(header.group(2))
+		if not raw_cols:
+			return None
+		cols = raw_cols[0]
+		body = text[header.end():].lstrip("\r\n")
+		data = []
+		for values in OnecDB._split_fields(body) or []:
+			width = len(cols)
+			values = values[:width] + [None] * (width - len(values))
+			data.append(dict(zip(cols, values)))
+		return data
+
+	@staticmethod
+	def _split_fields(text: str):
+		"""Разобрать поля через запятую; вернуть [[значение, …], …] или None.
+
+		Кавычки снимаются (удвоение → '"'); вне кавычек типизируется:
+		null → None, true/false → bool, целое/дробное → int/float, остальное → строка.
+		"""
+		rows, row = [], []
+		buf, quoted, was_quoted, done = [], False, False, False
+
+		def flush():
+			nonlocal buf, quoted, was_quoted, done, row
+			s = "".join(buf)
+			if was_quoted:
+				row.append(s.replace('""', '"'))
+			else:
+				t = s.strip()
+				if t == "null":
+					row.append(None)
+				elif t == "true":
+					row.append(True)
+				elif t == "false":
+					row.append(False)
+				elif re.fullmatch(r"-?\d+", t):
+					row.append(int(t))
+				elif re.fullmatch(r"-?\d+\.\d+", t):
+					row.append(float(t))
+				else:
+					row.append(t)
+			buf, quoted, was_quoted, done = [], False, False, False
+
+		i, n = 0, len(text)
+		while i < n:
+			c = text[i]
+			if quoted:
+				if c == '"':
+					if i + 1 < n and text[i + 1] == '"':
+						buf.append('"')
+						i += 2
+						continue
+					quoted = False
+					done = True
+					i += 1
+					continue
+				buf.append(c)
+				i += 1
+				continue
+			if c == '"':
+				# кавычка открывает поле: отступ/мусор до неё не входят
+				quoted = True
+				was_quoted = True
+				done = False
+				buf = []
+				i += 1
+				continue
+			if c == ",":
+				flush()
+				i += 1
+				continue
+			if c in "\r\n":
+				if buf or row or done:
+					flush()
+					rows.append(row)
+					row = []
+				i += 1
+				continue
+			if done:
+				i += 1
+				continue
+			buf.append(c)
+			i += 1
+		if buf or row or done:
+			flush()
+			rows.append(row)
+		return rows or None
 
 	# ── тестовые данные (замена юнит-фикстур) ──
 
