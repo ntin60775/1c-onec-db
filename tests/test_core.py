@@ -1,6 +1,5 @@
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
 import pytest
 
@@ -97,6 +96,9 @@ def test_create_object_bsl_generation():
 # ── фейковый MCP-сервер: полный handshake + tools/call ──
 
 class FakeMCPHandler(BaseHTTPRequestHandler):
+	# ответ на пробу принадлежности (СтрокаСоединенияИнформационнойБазы)
+	conn_string = 'File="/tmp/base-main"'
+
 	def _reply(self, obj, status=200):
 		payload = json.dumps(obj).encode("utf-8")
 		self.send_response(status)
@@ -126,6 +128,8 @@ class FakeMCPHandler(BaseHTTPRequestHandler):
 			elif code == "Результат = 4;":
 				# число 1С: сериализатор отдаёт строковым представлением «4»
 				inner = "4"
+			elif "СтрокаСоединенияИнформационнойБазы" in code:
+				inner = json.dumps(type(self).conn_string)
 			else:
 				# коллекция: сериализатор отдаёт целиком как JSON
 				inner = json.dumps({"echo": code})
@@ -141,15 +145,6 @@ class FakeMCPHandler(BaseHTTPRequestHandler):
 
 	def log_message(self, *a, **k):
 		pass
-
-
-@pytest.fixture()
-def fake_mcp():
-	httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeMCPHandler)
-	threading.Thread(target=httpd.serve_forever, daemon=True).start()
-	yield f"http://127.0.0.1:{httpd.server_address[1]}/mcp"
-	httpd.shutdown()
-	httpd.server_close()
 
 
 def test_full_mcp_flow(fake_mcp):
