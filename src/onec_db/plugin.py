@@ -90,13 +90,20 @@ def _expected_connection(root) -> str:
 	return ""
 
 
-def _base_keys(connection: str, root) -> dict:
-	"""Несущая базу часть строки соединения; относительный File= — от корня."""
+def _base_keys(connection: str, root, resolve_relative: bool) -> dict:
+	"""Несущая базу часть строки соединения (File/Srvr/Ref).
+
+	Относительный File= резолвится от корня ТОЛЬКО для привязки дерева
+	(resolve_relative=True): cwd клиента 1С фикстуре неизвестен, поэтому
+	относительный ответ прокси неоднозначен и резолвиться не должен.
+	"""
 	keys = _conn_keys(connection)
 	if "File" in keys:
 		path = keys["File"]
-		keys["File"] = os.path.normpath(path if path.startswith("/")
-		                                else os.path.join(str(root), path))
+		if path.startswith("/"):
+			keys["File"] = os.path.realpath(path)
+		elif resolve_relative:
+			keys["File"] = os.path.realpath(os.path.join(str(root), path))
 	return {k: keys[k] for k in _BASE_KEYS if k in keys}
 
 
@@ -118,7 +125,7 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 			f"onec_db: привязка базы не найдена в local-слое {root} "
 			"(infobases.origin.connection в v8project.local.yaml) — "
 			"принадлежность базы не сверить; прогони bootstrap контура")
-	expected = _base_keys(expected_raw, root)
+	expected = _base_keys(expected_raw, root, resolve_relative=True)
 	if not expected:
 		raise RuntimeError(
 			f"onec_db: в привязке дерева нет File=/Srvr+Ref: {expected_raw!r}")
@@ -128,16 +135,24 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 		raise RuntimeError(
 			f"onec_db: проба принадлежности не прошла — прокси {url} не отдал "
 			f"строку соединения ({e})") from e
-	actual = _base_keys(str(actual_raw), root)
+	actual = _base_keys(str(actual_raw), root, resolve_relative=False)
 	if not actual:
 		raise RuntimeError(
 			f"onec_db: прокси {url} не отдал строку соединения, получено: "
 			f"{str(actual_raw)[:200]!r}")
 	if expected != actual:
+		hint = ""
+		actual_file = _conn_keys(str(actual_raw)).get("File")
+		if actual_file and not actual_file.startswith("/"):
+			hint = ("  Прокси отдал относительный File= — стенд поднят старым "
+			        "раннером: перезапусти его (start_1c_db.sh <корень> "
+			        "--stop → --headless); раннер контура запускает клиент "
+			        "с абсолютным путём.\n")
 		raise RuntimeError(
 			"onec_db: канал 1c-db ведёт на ЧУЖУЮ базу — прогон не стартует.\n"
 			f"  дерево ({root}): {_fmt_base(expected)}\n"
 			f"  прокси  ({url}): {_fmt_base(actual)}\n"
+			+ hint +
 			"Типовая ловушка git-ворктри: дефолт :6003 — прокси ОСНОВНОГО дерева, "
 			"юниты молча пишут в чужую базу. Подними свой стенд: "
 			"bash .zcode/1c/scripts/start_1c_db.sh <корень-дерева> (порт из "

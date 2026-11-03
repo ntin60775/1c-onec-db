@@ -25,14 +25,21 @@ def test_conn_keys_strips_quotes_any_order():
 
 
 def test_base_keys_resolves_relative_file(tmp_path):
-	assert _base_keys('File="build/ib"', tmp_path) == \
+	assert _base_keys('File="build/ib"', tmp_path, resolve_relative=True) == \
 		{"File": str(tmp_path / "build" / "ib")}
-	assert _base_keys('File="/abs/base"', tmp_path) == {"File": "/abs/base"}
+	assert _base_keys('File="/abs/base"', tmp_path, resolve_relative=True) == \
+		{"File": "/abs/base"}
+
+
+def test_base_keys_keeps_proxy_relative_answer_unresolved(tmp_path):
+	# cwd клиента фикстуре неизвестен — относительный ответ прокси не резолвится
+	assert _base_keys('File="build/ib"', tmp_path, resolve_relative=False) == \
+		{"File": "build/ib"}
 
 
 def test_base_keys_keeps_path_keys_only():
-	assert _base_keys('Srvr="s";Ref="b";Dbms="MSSQLServer";Usr="u"', None) == \
-		{"Srvr": "s", "Ref": "b"}
+	assert _base_keys('Srvr="s";Ref="b";Dbms="MSSQLServer";Usr="u"', None,
+	                  resolve_relative=True) == {"Srvr": "s", "Ref": "b"}
 
 
 def test_expected_connection_prefers_local_over_main(tmp_path):
@@ -66,6 +73,17 @@ def test_probe_fails_on_foreign_base(tmp_path, fake_mcp, monkeypatch):
 	FakeMCPHandler.conn_string = 'File="/home/main/build/ib"'  # прокси основного дерева
 	with pytest.raises(RuntimeError, match="ЧУЖУЮ базу"):
 		_assert_owns_base(OnecDB(fake_mcp), "http://127.0.0.1:6003/mcp")
+
+
+def test_probe_fails_when_proxy_reports_relative(tmp_path, fake_mcp, monkeypatch):
+	# регресс ложного прохода: одинаковые ОТНОСИТЕЛЬНЫЕ строки у дерева
+	# («build/ib») и прокси — базы разных деревьев, совпадение строки ничего
+	# не доказывает; к тому же ведёт на перезапуск стенда старым раннером
+	root = _project(tmp_path)
+	monkeypatch.chdir(root)
+	FakeMCPHandler.conn_string = 'File="build/ib"'
+	with pytest.raises(RuntimeError, match="относительный File="):
+		_assert_owns_base(OnecDB(fake_mcp), fake_mcp)
 
 
 def test_probe_fails_without_local_binding(tmp_path, fake_mcp, monkeypatch):
