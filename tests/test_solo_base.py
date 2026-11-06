@@ -162,6 +162,10 @@ def run_pytest(root: Path, *test_files: Path, extra_env: dict = None,
                pytest_args: tuple = ()):
 	env = dict(os.environ, PYTHONPATH=SRC)
 	env.pop("ONEC_DB_URL", None)  # герметичность: url задаёт contour.json
+	# автозагрузка entry-points прочь: при установленном пакете (system/site)
+	# entry-point «onec_db» и явный «-p onec_db.plugin» зарегистрируют один
+	# модуль под двумя именами — pluggy падает «already registered»
+	env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 	if extra_env:
 		env.update(extra_env)
 	return subprocess.run(
