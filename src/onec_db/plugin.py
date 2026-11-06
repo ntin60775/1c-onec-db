@@ -3,8 +3,9 @@
 
 После установки пакета фикстуры доступны во всех тестах без conftest.
 URL 1c-db: env ONEC_DB_URL → .zcode/1c/contour.json (1c_db.url) → дефолт
-http://127.0.0.1:6003/mcp. Клиент 1c-db поднимает scripts/start_1c_db.sh
-контура; прод защищён mcp_gate — фикстуры только для тестовых деревьев.
+http://127.0.0.1:6003/mcp. Клиент 1c-db поднимает
+.zcode/1c/scripts/start_1c_db.sh контура; прод защищён mcp_gate —
+фикстуры только для тестовых деревьев.
 
 Проба принадлежности базы: фикстура сверяет базу, которую отдаёт прокси
 (``СтрокаСоединенияИнформационнойБазы()``), с привязкой дерева из
@@ -31,7 +32,7 @@ import pytest
 
 from .core import OnecDB, StubServer
 
-__all__ = ["onec_db", "stub_server", "solo_base", "OnecDB", "StubServer"]
+__all__ = ["onec_db", "solo_base", "stub_server", "OnecDB", "StubServer"]
 
 _PROBE_CODE = "Результат = СтрокаСоединенияИнформационнойБазы();"
 _BASE_KEYS = ("File", "Srvr", "Ref")
@@ -196,7 +197,7 @@ def stub_server():
 
 
 def _resolve_solo_connection(root) -> str:
-	"""Строка соединения базы для гашения по базе (``--stop --base``).
+	"""Строка соединения базы mono-стенда для гашения (``--stop --base``).
 
 	Источник — привязка дерева из local-слоя (тот же, что в пробе
 	принадлежности); относительный ``File=`` резолвится от корня — скрипт
@@ -210,8 +211,10 @@ def _resolve_solo_connection(root) -> str:
 			"соло-фикстуре не по чему гасить клиентов; прогони bootstrap контура")
 	keys = _base_keys(raw, root, resolve_relative=True)
 	if not keys:
+		# сырая привязка не печатается: в ней могут стоять Usr/Pwd
 		raise RuntimeError(
-			f"onec_db: в привязке дерева нет File=/Srvr+Ref: {raw!r}")
+			f"onec_db: в привязке дерева {root} нет несущих базу ключей "
+			"File=/Srvr+Ref — гашение адресуется строкой соединения")
 	return _fmt_base(keys)
 
 
@@ -219,12 +222,16 @@ def _channel_from_url(url: str) -> str:
 	"""Канал изоляции из url (``?channel=…``); пусто — mono-стенд."""
 	query = urllib.parse.urlparse(url).query
 	values = urllib.parse.parse_qs(query).get("channel") or []
+	if len(values) > 1:
+		raise RuntimeError(f"onec_db: в url несколько channel: {url}")
 	return values[0] if values else ""
 
 
 def _yaml_inline_value(val: str) -> str:
 	"""Значение YAML-поля: inline-комментарий (вне кавычек) прочь, кавычки
-	снимаются — ``channel: 'quoted1' # инлайн`` → ``quoted1``."""
+	снимаются — ``channel: 'quoted1' # инлайн`` → ``quoted1``. Подмножество
+	контракта instances_py раннера: файл, который раннер отвергнет, может
+	читаться здесь иначе — старт инстанса вскрыл бы расхождение раньше."""
 	out, in_q = "", None
 	for ch in val:
 		if in_q:
@@ -242,76 +249,110 @@ def _yaml_inline_value(val: str) -> str:
 	return out.strip()
 
 
-def _instance_for_channel(root, url: str) -> str:
-	"""Имя инстанса для восстановления по каналу из url; пусто — mono.
+def _instance_for_channel(root, url: str):
+	"""(имя инстанса, его connection) для восстановления по каналу из url;
+	``("", "")`` — mono-стенд.
 
-	Канал инстанса — поле ``channel`` записи или её имя (дефолт раннера).
-	Канал в url без инстанса — громкий отказ: молчаливый mono вернул бы
+	Канал инстанса — поле ``channel`` записи или её имя (дефолт раннера);
+	отступ имён не фиксируется — раннер берёт его из первой вложенной
+	строки, здесь так же. Канал в url без инстанса, ведущий к нескольким
+	или от записи без connection — громкий отказ: молчаливый mono вернул бы
 	клиент без канала и свёл бы два стенда в один.
 	"""
 	channel = _channel_from_url(url)
 	if not channel:
-		return ""
+		return "", ""
 	path = pathlib.Path(root) / ".zcode" / "1c" / "db-instances.yaml"
 	if not path.is_file():
 		raise RuntimeError(
 			f"onec_db: канал {channel} в url ({url}), но нет {path} — "
 			"инстанс для восстановления не найти; подними инстанс или "
 			"убери channel из url")
-	by_name = {}
+	entries = {}  # имя → {channel, connection}
 	current = None
+	name_indent = None
 	in_instances = False
-	for line in path.read_text(encoding="utf-8-sig").splitlines():
+	for lineno, line in enumerate(
+			path.read_text(encoding="utf-8-sig").splitlines(), 1):
 		stripped = line.strip()
 		if not stripped or stripped.startswith("#") or stripped == "---":
 			continue
+		lead = line[: len(line) - len(line.lstrip())]
+		if "\t" in lead:
+			raise RuntimeError(
+				f"onec_db: {path}: строка {lineno}: таб в отступе — YAML "
+				"табов не допускает (раннер такой файл тоже отвергнет)")
 		if not line[:1].isspace():
 			in_instances = stripped.rstrip(":") == "instances"
 			current = None
 			continue
 		if not in_instances:
 			continue
-		indent = len(line) - len(line.lstrip())
+		indent = len(lead)
 		key, _, val = stripped.partition(":")
 		key = key.strip().strip("'\"")
 		val = _yaml_inline_value(val)
-		if indent == 2 and not val:
+		if name_indent is None:
+			name_indent = indent  # раннер берёт отступ из первой вложенной
+		if indent == name_indent:
+			if val:
+				raise RuntimeError(
+					f"onec_db: {path}: строка {lineno}: «{key}:» с значением "
+					"на отступе имени инстанса — ожидался вложенный список "
+					"полей (раннер такой файл тоже отвергнет)")
 			current = key
-			by_name[current] = current  # дефолт канала раннера — имя инстанса
-		elif current and key == "channel" and val:
-			by_name[current] = val
-	for name, ch in by_name.items():
-		if ch == channel:
-			return name
-	known = ", ".join(f"{n}→{c}" for n, c in by_name.items()) or "записей нет"
-	raise RuntimeError(
-		f"onec_db: канал {channel} в url ({url}), но в {path} нет инстанса "
-		f"с этим каналом ({known}) — восстанови клиента руками или задай "
-		"channel в записи")
+			entries[current] = {"channel": "", "connection": ""}
+		elif current is not None and key in ("channel", "connection"):
+			entries[current][key] = val
+	matches = [n for n, e in entries.items()
+	           if (e["channel"] or n) == channel]
+	if len(matches) > 1:
+		raise RuntimeError(
+			f"onec_db: канал {channel} ведёт к нескольким инстансам "
+			f"({', '.join(sorted(matches))}) в {path} — восстановление "
+			"неоднозначно; разведи каналы в записях")
+	if not matches:
+		known = ", ".join(f"{n}→{e['channel'] or n}"
+		                  for n, e in entries.items()) or "записей нет"
+		raise RuntimeError(
+			f"onec_db: канал {channel} в url ({url}), но в {path} нет инстанса "
+			f"с этим каналом ({known}) — восстанови клиента руками или задай "
+			"channel в записи")
+	name = matches[0]
+	conn = entries[name]["connection"]
+	if not conn:
+		raise RuntimeError(
+			f"onec_db: у инстанса {name} в {path} нет connection — гашение "
+			"адресуется строкой соединения записи; заполни поле")
+	return name, conn
 
 
 def _run_starter(script, root, *args: str) -> subprocess.CompletedProcess:
 	"""Вызов скрипта контура с результатом; вызыватель решает, громкий ли сбой.
 
-	Потолок 600 с: старт стенда ждёт подключения клиента до ~7 мин
-	(WAIT_DEADLINE раннера) плюс прогрев словаря анонимизации.
+	Потолок — дедлайн ожидания стенда раннера (env WAIT_DEADLINE, дефолт
+	420 с; тяжёлые базы его поднимают — скилл 1c-db-data) плюс запас на
+	прогрев словаря анонимизации. TimeoutExpired оборачивается внятно:
+	клиент стартует через setsid и может продолжать подъём в фоне.
 	"""
-	return subprocess.run(["bash", str(script), str(root), *args],
-	                      capture_output=True, text=True, timeout=600)
+	try:
+		deadline = int(os.environ.get("WAIT_DEADLINE", "420")) + 180
+	except ValueError:
+		raise RuntimeError(
+			f"onec_db: WAIT_DEADLINE не число: "
+			f"{os.environ.get('WAIT_DEADLINE')!r}") from None
+	try:
+		return subprocess.run(["bash", str(script), str(root), *args],
+		                      capture_output=True, text=True, timeout=deadline)
+	except subprocess.TimeoutExpired as e:
+		raise RuntimeError(
+			f"onec_db: {' '.join(args) or 'старт'} не уложился в потолок "
+			f"{deadline} с — подъём может продолжаться в фоне (setsid); "
+			"проверь стенд руками") from e
 
 
-@pytest.fixture(scope="module")
-def solo_base():
-	"""Соло-режим модуля GUI-тестов на базе 1c-db.
-
-	Перед первым тестом модуля клиенты базы гасятся (``--stop --base``
-	скрипта контура, гашение всегда по строке соединения), после модуля —
-	в ``finally``, включая падение по ассерту, клиент поднимается обратно:
-	mono или ``--instance`` по каналу из url (способ подъёма фиксируется
-	до гашения). Прокси фикстура не гасит и не поднимает (один прокси на
-	проект); клиента до гашения не было — восстановление ничего не
-	поднимает. Живой прокси — предусловие среды, как у ``onec_db``.
-	"""
+def _solo_base_setup():
+	"""Резолв и гашение перед соло-модулем; state — для _solo_base_restore."""
 	root = _find_root()
 	if root is None:
 		raise RuntimeError(
@@ -324,38 +365,78 @@ def solo_base():
 			f"onec_db: нет {script} — соло-фикстура гасит/поднимает клиента "
 			"скриптом контура; доставь скрипт (маппинг scripts/ контура "
 			"кладёт его в .zcode/1c/scripts) или убери solo_base")
-	conn = _resolve_solo_connection(root)
-	if "Srvr=" in conn:
+	# Гашение адресуется базой стенда: инстанс — строка соединения своей
+	# записи (база инстанса отлична от привязки дерева по построению
+	# stand-замка «один клиент на файловую базу»), mono — привязка дерева.
+	# Восстановление фиксируется до гашения: инстанс — из канала url.
+	# Относительный File= резолвится от корня — скрипт поднимает клиента
+	# с абсолютной строкой, адрес по одной realpath-форме с ним.
+	instance, instance_conn = _instance_for_channel(root, _resolve_url())
+	keys = _base_keys(instance_conn or _resolve_solo_connection(root),
+	                  root, resolve_relative=True)
+	if not keys:
+		raise RuntimeError(
+			"onec_db: в строке соединения стенда нет несущих базу ключей "
+			"File=/Srvr+Ref — гашение адресуется строкой соединения")
+	conn = _fmt_base(keys)
+	if not conn.startswith("File="):
 		raise RuntimeError(
 			f"onec_db: соло-фикстура поддержана для файловых баз (строка "
-			f"File=), привязка дерева: {conn} — серверную базу гасят "
-			"поимённо (--stop --instance контура)")
-	instance = _instance_for_channel(root, _resolve_url())
+			f"File=); серверную базу гасят поимённо (--stop --instance "
+			"контура)")
 	stop = _run_starter(script, root, "--stop", "--base", conn)
 	if stop.returncode != 0:
 		raise RuntimeError(
 			f"onec_db: --stop --base не прошёл (rc {stop.returncode}): "
 			f"{stop.stderr.strip()[:300]}")
-	had_client = "не найдено" not in stop.stdout
+	# контракт вывода раннера: «• клиентов базы остановлено: N» — клиенты
+	# были; «не найдено» (или иной вывод) — гасить нечего, не восстанавливаем
+	had_client = "остановлено" in stop.stdout
+	return {"script": script, "root": root, "instance": instance,
+	        "had_client": had_client}
+
+
+def _solo_base_restore(state):
+	if not state["had_client"]:
+		return
+	args = ("--instance", state["instance"]) if state["instance"] else ()
+	restore = _run_starter(state["script"], state["root"], *args)
+	if restore.returncode != 0:
+		label = (f" --instance {state['instance']}"
+		         if state["instance"] else "mono")
+		raise RuntimeError(
+			"onec_db: восстановление клиента после соло-модуля не "
+			f"прошло ({label}, rc {restore.returncode}): "
+			f"{restore.stderr.strip()[:300]}")
+
+
+@pytest.fixture(scope="module")
+def solo_base():
+	"""Соло-режим модуля GUI-тестов на базе 1c-db.
+
+	Перед первым тестом модуля клиенты базы гасятся (``--stop --base``
+	скрипта контура: инстанс — по строке соединения своей записи,
+	mono — по привязке дерева), после модуля — в ``finally``, включая
+	падение по ассерту, клиент стенда поднимается обратно: mono или
+	``--instance`` по каналу из url. Гашение по базе бьёт всех клиентов
+	той базы, возвращается один клиент стенда; клиента до гашения не было
+	— восстановление ничего не поднимает. Прокси фикстура не гасит и не
+	поднимает; мёртвый прокси старт стенда поднимет сам — живой прокси
+	остаётся предусловием среды, как у ``onec_db``.
+	"""
+	state = _solo_base_setup()
 	try:
 		yield
 	finally:
-		if had_client:
-			args = ("--instance", instance) if instance else ()
-			restore = _run_starter(script, root, *args)
-			if restore.returncode != 0:
-				label = f" --instance {instance}" if instance else ""
-				raise RuntimeError(
-					"onec_db: восстановление клиента после соло-модуля не "
-					f"прошло ({label or 'mono'}, rc {restore.returncode}): "
-					f"{restore.stderr.strip()[:300]}")
+		_solo_base_restore(state)
 
 
 def pytest_configure(config):
 	config.addinivalue_line(
 		"markers",
 		"e2e_solo: модуль идёт соло на базе 1c-db (плагин вешает по "
-		"использованию solo_base; run_e2e делит выборку по маркеру)")
+		"использованию solo_base; run_e2e юнита #56 Т8 делит выборку "
+		"по маркеру)")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -364,17 +445,35 @@ def pytest_collection_modifyitems(config, items):
 	Использование ``solo_base`` хоть одним тестом модуля делает соло весь
 	модуль: module-scoped фикстура добавляется остальным тестам модуля
 	(гашение до первого теста), маркер вешается на все item — литерал
-	маркера в файле теста не обязателен.
+	маркера в файле теста не обязателен. Смешение с сессионным ``onec_db``
+	и локальное перекрытие плагинной фикстуры — громкий отказ на сборе.
 	"""
 	by_module = {}
 	for item in items:
 		module = getattr(item, "module", None)
 		if module is not None:
 			by_module.setdefault(module, []).append(item)
-	for group in by_module.values():
+	for module, group in by_module.items():
 		if not any("solo_base" in item.fixturenames for item in group):
 			continue
+		if any("onec_db" in item.fixturenames for item in group):
+			pytest.fail(
+				f"onec_db: модуль {module.__name__} смешивает solo_base и "
+				"onec_db — соло-фикстура гасит клиента под живой сессионной "
+				"фикстурой, канал протухнет в следующих тестах; разнеси их "
+				"по разным модулям (run_e2e делит сеансы по маркеру "
+				"e2e_solo)", pytrace=False)
 		for item in group:
+			defs = getattr(getattr(item, "_fixtureinfo", None),
+			               "name2fixturedefs", {}).get("solo_base")
+			if defs:
+				owner = getattr(defs[-1].func, "__module__", "")
+				if owner and owner != "onec_db.plugin":
+					pytest.fail(
+						f"onec_db: фикстура solo_base из {owner} перекрывает "
+						"плагинную — копия рецепта тихо обходит проверки "
+						"(путь скрипта, резолв инстанса); удали локальную "
+						"и используй плагинную", pytrace=False)
 			if "solo_base" not in item.fixturenames:
 				item.fixturenames.append("solo_base")
 			if not item.get_closest_marker("e2e_solo"):

@@ -2,14 +2,16 @@
 
 Критерии тикета процессами: соло-модуль гасит «клиента» перед модулем и
 поднимает после (исход «тест упал ассертом» — тот же результат), прокси
-переживает модуль, маркер автоповеска виден на всём модуле, канал из url
-разводит восстановление mono/``--instance`` (гашение всегда по базе).
+переживает модуль, маркер автоповеска виден при сборе выборки, канал из
+url разводит восстановление mono/``--instance`` (гашение инстанс-стенда —
+по строке соединения записи), клиента не было — восстановление не звалось.
 
 Клиент и прокси — настоящие спящие процессы; скрипт контура — фейк,
 который гасит/поднимает настоящий процесс и логирует argv. pytest-сеансы
 — subprocess с PYTHONPATH этого дерева и явной загрузкой плагина
 (``-p onec_db.plugin``): dev-venv держит editable-установку другого
-каталога, ворктри-прогон не должен её видеть.
+каталога, ворктри-прогон не должен её видеть. env сеансов герметичен
+по ONEC_DB_URL — штатная практика ворктри не должна менять резолв.
 """
 import os
 import subprocess
@@ -18,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from onec_db.plugin import _channel_from_url, _instance_for_channel
+from onec_db.plugin import (_channel_from_url, _instance_for_channel,
+                            _solo_base_setup)
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = str(REPO / "src")
@@ -58,9 +61,6 @@ from pathlib import Path
 def _alive(pidfile):
 	try:
 		pid = int(Path(pidfile).read_text())
-	except Exception:
-		return False
-	try:
 		st = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
 	except OSError:
 		return False
@@ -74,6 +74,30 @@ def test_inside_solo(solo_base):
 
 def test_marker_without_explicit_fixture(request):
 	assert "e2e_solo" in [m.name for m in request.node.iter_markers()]
+"""
+
+# первый тест модуля БЕЗ явной фикстуры — автоповеска в fixturenames
+# должна поднять её до первого теста (живость клиента проверяется в env)
+SOLO_MODULE_PLAIN_FIRST = """\
+import os
+from pathlib import Path
+
+
+def _alive(pidfile):
+	try:
+		pid = int(Path(pidfile).read_text())
+		st = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+	except OSError:
+		return False
+	return st.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def test_first_plain():
+	assert not _alive(os.environ["SOLO_CLIENT_PID"])
+
+
+def test_second_explicit(solo_base):
+	assert True
 """
 
 FAILING_MODULE = """\
@@ -131,16 +155,18 @@ def make_project(tmp: Path, url: str, instances: str = "") -> Path:
 	                                     pidfile=tmp / "client.pid"),
 	                  encoding="utf-8")
 	script.chmod(0o755)
-	return root
+	return root.resolve()  # realpath: ожидания соединения строятся от него
 
 
-def run_pytest(root: Path, *test_files: Path, extra_env: dict = None):
+def run_pytest(root: Path, *test_files: Path, extra_env: dict = None,
+               pytest_args: tuple = ()):
 	env = dict(os.environ, PYTHONPATH=SRC)
+	env.pop("ONEC_DB_URL", None)  # герметичность: url задаёт contour.json
 	if extra_env:
 		env.update(extra_env)
 	return subprocess.run(
 		[sys.executable, "-m", "pytest", "-p", "onec_db.plugin", "-q",
-		 *[str(f) for f in test_files]],
+		 *pytest_args, *[str(f) for f in test_files]],
 		capture_output=True, text=True, timeout=120, env=env, cwd=root)
 
 
@@ -163,6 +189,11 @@ def calls(log: Path) -> list[str]:
 	        if ln.strip()]
 
 
+def reap(proc: subprocess.Popen):
+	proc.kill()
+	proc.wait()
+
+
 # ── критерии 1–2: гашение/восстановление, падший прогон, прокси переживает ──
 
 def test_solo_module_guards_and_restores(tmp_path):
@@ -183,7 +214,8 @@ def test_solo_module_guards_and_restores(tmp_path):
 		assert alive_proc(client), "клиент не восстановлен после соло-модуля"
 		assert alive_proc(proxy_pid), "прокси пережить соло-модуль не смог"
 
-		# гашение — по строке соединения, без --instance; восстановление mono
+		# гашение — по строке соединения привязки дерева, без --instance;
+		# восстановление mono
 		log = calls(tmp_path / "calls.log")
 		assert len(log) == 3, log  # raise_client + stop + restore
 		expected_conn = f"File={root / 'build' / 'ib'}"
@@ -199,51 +231,76 @@ def test_solo_module_guards_and_restores(tmp_path):
 		assert alive_proc(proxy_pid), "прокси погиб на падшем прогоне"
 
 		# второй pytest-сеанс на той же базе не зависит: клиент, поднятый
-		# восстановлением, гасится снова («остановлено: 1», не «не найдено»)
+		# восстановлением, гасится снова («остановлено», не «не найдено»)
 		r3 = run_pytest(root, solo, extra_env=env)
 		assert r3.returncode == 0, \
 			f"rc={r3.returncode}, out={r3.stdout[-600:]!r}, err={r3.stderr[-200:]!r}"
 		assert alive_proc(client) and alive_proc(proxy_pid)
 		log = calls(tmp_path / "calls.log")
 		assert len(log) == 7, (log, r2.stdout[-400:], r3.stdout[-400:])
+		assert "не найдено" not in "\n".join(log), log
 	finally:
-		proxy.kill()
+		reap(proxy)
 		if (tmp_path / "client.pid").exists():
-			pid = int((tmp_path / "client.pid").read_text())
-			subprocess.run(["kill", str(pid)], capture_output=True)
+			pid = (tmp_path / "client.pid").read_text().strip()
+			subprocess.run(["kill", pid], capture_output=True)
 
 
-# ── критерий 3: маркер автоповеска — уже в SOLO_MODULE (оба теста модуля ──
-# ── без литерала маркера assert'ят e2e_solo); здесь — сбор выборки        ──
+# ── границы тикета: клиента не было — восстановление ничего не поднимает ──
+
+def test_no_client_means_no_restore(tmp_path):
+	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
+	solo = write_test(root, "test_solo_n.py",
+	                  "def test_passes(solo_base):\n    pass\n")
+	client = Path(tmp_path / "client.pid")
+	r = run_pytest(root, solo)  # клиента до гашения не поднимали
+	assert r.returncode == 0, r.stdout + r.stderr
+	expected_conn = f"File={root / 'build' / 'ib'}"
+	log = calls(tmp_path / "calls.log")
+	assert log == [f"{root} --stop --base {expected_conn}"], log
+	assert not client.exists(), "фейк-старт звался — восстановление сработало"
+
+
+# ── критерий 3: маркер автоповеска виден при сборе выборки ──
 
 def test_marker_visible_at_collection(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
-	solo = write_test(root, "test_solo_c.py", SOLO_MODULE)
-	raise_client(root)
-	client = Path(tmp_path / "client.pid")
-	proxy = sleeper()
+	solo = write_test(root, "test_solo_m.py", SOLO_MODULE)
+	# pytest 9, collect-only -q: сводка «tests/test_solo_m.py: 2»
+	r_yes = run_pytest(root, solo, pytest_args=("--collect-only", "-q",
+	                                            "-m", "e2e_solo"))
+	assert r_yes.returncode == 0, r_yes.stdout + r_yes.stderr
+	assert "test_solo_m.py: 2" in r_yes.stdout, r_yes.stdout
+	r_no = run_pytest(root, solo, pytest_args=("--collect-only", "-q",
+	                                           "-m", "not e2e_solo"))
+	# rc 5 = «0 тестов отобрано» — весь модуль под маркером
+	assert r_no.returncode == 5, \
+		f"rc={r_no.returncode}, out={r_no.stdout[-300:]!r}"
+	assert "test_solo_m.py" not in r_no.stdout, r_no.stdout
+
+
+# автоповеска фикстуры: первый тест модуля без явного solo_base — гашение
+# до него (фикстура дописана в fixturenames плагином)
+
+def test_autofixture_reaches_first_plain_test(tmp_path):
+	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
+	solo = write_test(root, "test_solo_p.py", SOLO_MODULE_PLAIN_FIRST)
 	try:
-		env = {"SOLO_CLIENT_PID": str(client),
-		       "SOLO_PROXY_PID": str(tmp_path / "proxy.pid")}
-		r = subprocess.run(
-			[sys.executable, "-m", "pytest", "-p", "onec_db.plugin",
-			 "--collect-only", "-q", str(solo)],
-			capture_output=True, text=True, timeout=300,
-			env=dict(os.environ, PYTHONPATH=SRC), cwd=root)
+		raise_client(root)
+		client = Path(tmp_path / "client.pid")
+		r = run_pytest(root, solo,
+		               extra_env={"SOLO_CLIENT_PID": str(client)})
 		assert r.returncode == 0, r.stdout + r.stderr
-		# маркер в коллекции: 2 теста модуля в одном сеансе соло
-		assert r.stdout.count("::") >= 2, r.stdout
-		# фикстура гашение так и не сделала до тестов — сеанс collect-only
-		# не запускает фикстуры: клиент жив
-		assert alive_proc(client)
+		assert alive_proc(client), "клиент не восстановлен после соло-модуля"
+		assert len(calls(tmp_path / "calls.log")) == 3
 	finally:
-		proxy.kill()
-		if client.exists():
-			subprocess.run(["kill", str(client.read_text().strip())],
-			               capture_output=True)
+		if (tmp_path / "client.pid").exists():
+			pid = (tmp_path / "client.pid").read_text().strip()
+			subprocess.run(["kill", pid], capture_output=True)
 
 
-# ── критерий 4: канал из url — mono и --instance восстановления ──
+# ── критерий 4: канал из url — mono и --instance восстановления; гашение
+# инстанс-стенда адресуется строкой соединения записи (не привязкой дерева) ──
 
 def test_channel_resolves_instance_restore(tmp_path):
 	root = make_project(
@@ -264,16 +321,17 @@ def test_channel_resolves_instance_restore(tmp_path):
 		assert r.returncode == 0, r.stdout + r.stderr
 		log = calls(tmp_path / "calls.log")
 		assert len(log) == 3, log  # raise_client + stop + restore
-		expected_conn = f"File={root / 'build' / 'ib'}"
-		# гашение всегда по строке соединения — --instance только в подъеме
+		expected_conn = f"File={root / 'build' / 'ib' / 's1'}"
+		# гашение инстанс-стенда — по connection записи (база инстанса
+		# отлична от привязки дерева), --instance только в подъеме
 		assert log[1] == f"{root} --stop --base {expected_conn}", log[1]
 		assert log[2] == f"{root} --instance solo1", log[2]
 		assert alive_proc(client)
 		assert alive_proc(tmp_path / "proxy.pid"), "прокси пережить модуль не смог"
 	finally:
-		proxy.kill()
+		reap(proxy)
 		if client.exists():
-			subprocess.run(["kill", str(client.read_text().strip())],
+			subprocess.run(["kill", client.read_text().strip()],
 			               capture_output=True)
 
 
@@ -295,8 +353,53 @@ def test_channel_without_instance_fails_loud(tmp_path):
 		assert calls(tmp_path / "calls.log") == [str(root)]  # только raise_client
 	finally:
 		if client.exists():
-			subprocess.run(["kill", str(client.read_text().strip())],
+			subprocess.run(["kill", client.read_text().strip()],
 			               capture_output=True)
+
+
+# ── громкие отказы фикстуры (in-process: резолв до subprocess) ──
+
+def _project_min(tmp: Path, connection: str) -> Path:
+	root = tmp / "proj"
+	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
+	(root / "v8project.local.yaml").write_text(
+		"infobases:\n  origin:\n"
+		f"    connection: '{connection}'\n", encoding="utf-8")
+	return root.resolve()
+
+
+def test_setup_fails_without_contour_root(tmp_path, monkeypatch):
+	monkeypatch.chdir(tmp_path)
+	with pytest.raises(RuntimeError, match="корень проекта контура не найден"):
+		_solo_base_setup()
+
+
+def test_setup_fails_without_script(tmp_path, monkeypatch):
+	root = _project_min(tmp_path, "File=build/ib")
+	monkeypatch.chdir(root)  # скрипт .zcode/1c/scripts не доставлен
+	with pytest.raises(RuntimeError, match="скриптом контура"):
+		_solo_base_setup()
+
+
+def test_setup_fails_on_server_base(tmp_path, monkeypatch):
+	root = _project_min(tmp_path, "Srvr=srv-01;Ref=demo_base")
+	monkeypatch.chdir(root)
+	(root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh").write_text(
+		"", encoding="utf-8")
+	with pytest.raises(RuntimeError, match="файловых баз"):
+		_solo_base_setup()
+
+
+def test_setup_fails_without_binding(tmp_path, monkeypatch):
+	root = tmp_path / "proj"
+	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
+	monkeypatch.chdir(root)
+	(root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh").write_text(
+		"", encoding="utf-8")
+	with pytest.raises(RuntimeError, match="привязка базы не найдена"):
+		_solo_base_setup()
 
 
 # ── юнит-тесты резолва канала (in-process, как test_plugin) ──
@@ -305,6 +408,8 @@ def test_channel_from_url_variants():
 	assert _channel_from_url("http://127.0.0.1:6004/mcp?channel=inst2") == "inst2"
 	assert _channel_from_url("http://127.0.0.1:6003/mcp") == ""
 	assert _channel_from_url("http://127.0.0.1:6004/mcp?a=b&channel=inst3") == "inst3"
+	with pytest.raises(RuntimeError, match="несколько channel"):
+		_channel_from_url("http://127.0.0.1:6004/mcp?channel=a&channel=b")
 
 
 def test_instance_for_channel_defaults_to_name(tmp_path):
@@ -317,34 +422,40 @@ def test_instance_for_channel_defaults_to_name(tmp_path):
 		"  solo2:\n    channel: other2\n"
 		"    connection: File=build/ib/s2\n"
 		"    user: u\n    password: p\n", encoding="utf-8")
-	# канал не задан — дефолт раннера: имя инстанса
+	# канал не задан — дефолт раннера: имя инстанса; connection возвращается
 	assert _instance_for_channel(tmp_path,
-	                             "http://127.0.0.1:6004/mcp?channel=solo1") == "solo1"
+	                             "http://127.0.0.1:6004/mcp?channel=solo1") == \
+		("solo1", "File=build/ib/s1")
 	assert _instance_for_channel(tmp_path,
-	                             "http://127.0.0.1:6004/mcp?channel=other2") == "solo2"
+	                             "http://127.0.0.1:6004/mcp?channel=other2") == \
+		("solo2", "File=build/ib/s2")
 
 
-def test_instance_for_channel_ignores_comments_and_doc_marker(tmp_path):
+def test_instance_for_channel_indents_and_comments(tmp_path):
 	cfg = tmp_path / ".zcode" / "1c" / "db-instances.yaml"
 	cfg.parent.mkdir(parents=True)
+	# отступ 4 (раннер берёт name_indent из первой вложенной) + комментарии
 	cfg.write_text(
-		"---\n"
 		"# комментарий\n"
+		"---\n"
 		"instances:\n"
-		"  solo1:\n    channel: 'quoted1' # инлайн\n"
-		"    connection: File=build/ib/s1\n"
-		"    user: u\n    password: p\n", encoding="utf-8")
+		"    solo1:\n"
+		"        channel: 'quoted1' # инлайн\n"
+		"        connection: File=build/ib/s1\n"
+		"        user: u\n"
+		"        password: p\n", encoding="utf-8")
 	assert _instance_for_channel(tmp_path,
-	                             "http://127.0.0.1:6004/mcp?channel=quoted1") == "solo1"
+	                             "http://127.0.0.1:6004/mcp?channel=quoted1") == \
+		("solo1", "File=build/ib/s1")
 
 
-def test_instance_for_channel_fails_loud(tmp_path):
-	with pytest.raises(RuntimeError, match="db-instances.yaml"):
-		_instance_for_channel(tmp_path, "http://127.0.0.1:6004/mcp?channel=x")
+def test_instance_for_channel_ambiguous_fails_loud(tmp_path):
 	cfg = tmp_path / ".zcode" / "1c" / "db-instances.yaml"
 	cfg.parent.mkdir(parents=True)
 	cfg.write_text(
-		"instances:\n  other:\n    connection: File=ib\n"
-		"    user: u\n    password: p\n", encoding="utf-8")
-	with pytest.raises(RuntimeError, match="нет инстанса с этим каналом"):
-		_instance_for_channel(tmp_path, "http://127.0.0.1:6004/mcp?channel=ghost")
+		"instances:\n"
+		"  one:\n    channel: same\n    connection: File=ib1\n"
+		"  two:\n    channel: same\n    connection: File=ib2\n",
+		encoding="utf-8")
+	with pytest.raises(RuntimeError, match="нескольким инстансам"):
+		_instance_for_channel(tmp_path, "http://127.0.0.1:6004/mcp?channel=same")
