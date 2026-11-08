@@ -25,11 +25,13 @@ local-слоя (v8project.local.yaml → v8project.yaml; ``File=`` / ``Srvr+Ref`
 фикстурами плагина за сеанс (сегодня — соло-восстановление), гасятся в
 конце сеанса правилом гашения контура (короткие одиночные kill +
 перепроверка, добивание по pid). Перечень — реестр подъёмов, не
-cmdline-матч по базе: клиент той же базы, поднятый не сеансом (GUI-клиент
+cmdline-матч по базе: клиент, поднятый не фикстурами плагина (GUI-клиент
 testpilot, ручной старт), финализации не принадлежит — его гасят
-``--stop --base`` или следующий старт. Прокси финализация не гасит
-никогда (общий на проект); граница: kill -9 самого pytest финализацию
-не выполняет — остатки чинит следующий старт.
+``--stop --base``; чистку сирот несёт старт контура (Т5 юнита #56,
+ещё не отгружен). Прокси финализация не гасит никогда (общий на
+проект); граница: kill -9 самого pytest финализацию не выполняет —
+зомби-прокси и сироты останутся до следующего старта (Т4/Т5 юнита
+#56, ещё не отгружены).
 """
 import json
 import os
@@ -416,26 +418,46 @@ def _solo_base_setup():
 	        "had_client": had_client, "file": keys.get("File", "")}
 
 
+def _register_client_pid(stdout, file_path: str) -> bool:
+	"""pid из контракта вывода скрипта «• клиент запущен (pid N)» — в реестр
+	сеанса. Возвращает, назван ли pid."""
+	if isinstance(stdout, bytes):
+		stdout = stdout.decode("utf-8", "replace")
+	m = _CLIENT_PID_RE.search(stdout or "")
+	if not m:
+		return False
+	_SESSION_CLIENTS.append((int(m.group(1)), file_path))
+	return True
+
+
 def _solo_base_restore(state):
 	if not state["had_client"]:
 		return
 	args = ("--instance", state["instance"]) if state["instance"] else ()
-	restore = _run_starter(state["script"], state["root"], *args)
+	try:
+		restore = _run_starter(state["script"], state["root"], *args)
+	except RuntimeError as e:
+		# pid печатается скриптом до ожидания подключения: клиент мог
+		# подняться и при сорванном по потолку старте — сеанс не должен
+		# оставить поднятого без реестра (TimeoutExpired — его причина)
+		_register_client_pid(getattr(e.__cause__, "stdout", None),
+		                     state["file"])
+		raise
 	if restore.returncode != 0:
+		# то же при неудачном rc: «не прошло» говорит о фазе ожидания,
+		# не о факте подъёма — клиент мог подняться
+		_register_client_pid(restore.stdout, state["file"])
 		label = (f" --instance {state['instance']}"
 		         if state["instance"] else "mono")
 		raise RuntimeError(
 			"onec_db: восстановление клиента после соло-модуля не "
 			f"прошло ({label}, rc {restore.returncode}): "
 			f"{restore.stderr.strip()[:300]}")
-	m = _CLIENT_PID_RE.search(restore.stdout)
-	if m:
-		_SESSION_CLIENTS.append((int(m.group(1)), state["file"]))
-	else:
+	if not _register_client_pid(restore.stdout, state["file"]):
 		# клиент поднят, но финализации он не принадлежит: имени нет
 		print("onec_db: старт не назвал pid клиента — финализация его не "
-		      "гасит; остатки чинит следующий старт (юнит #56 Т5)",
-		      file=sys.stderr)
+		      "гасит; чистку сирот несёт старт контура (Т5 юнита #56, "
+		      "ещё впереди)", file=sys.stderr)
 
 
 def _alive(pid: int) -> bool:
@@ -453,7 +475,12 @@ def _alive(pid: int) -> bool:
 
 def _cmdline_files(pid: int) -> list:
 	"""realpath значений File= из cmdline процесса (по одному на аргумент);
-	пусто — процесс не клиент файловой базы."""
+	пусто — процесс не клиент файловой базы.
+
+	Отступления от канона stop_base_py, оба безопасны: относительный путь
+	резолвится от cwd (реестровый клиент всегда абсолютен — так его
+	поднимает скрипт контура), пустой File= пропускается без fail() —
+	гвард сканирует чужие cmdline, конфигурационный отказ не годится."""
 	files = []
 	try:
 		raw = open(f"/proc/{pid}/cmdline", "rb").read()
@@ -490,10 +517,11 @@ def _finalize_clients():
 	"""
 	targets = []
 	seen = set()
-	for pid, file_path in _SESSION_CLIENTS:
-		if pid in seen:
+	for entry in _SESSION_CLIENTS:
+		pid, file_path = entry
+		if entry in seen:  # пара (pid, путь): тот же pid мог уйти другой базе
 			continue
-		seen.add(pid)
+		seen.add(entry)
 		if _alive(pid) and file_path in _cmdline_files(pid):
 			targets.append(pid)
 	for pid in targets:
@@ -531,13 +559,14 @@ def pytest_sessionfinish(session, exitstatus):
 	"""Финализация сеанса (юнит #56 Т3): гашение поднятых фикстурами клиентов.
 
 	Перечень — реестр подъёмов фикстур плагина (сегодня —
-	соло-восстановление; канал-фикстура onec_db процессов не поднимает,
-	ей в реестре нечего носить). Гасится и на зелёном сеансе: сеанс не
-	оставляет поднятых им клиентов — критерий 3 тикета квалификатора
-	«падший» не несёт. Прокси не гасится никогда — общий на проект
-	(решение владельца #37); зомби-прокси чинит следующий старт (Т4).
-	Граница: kill -9 самого pytest финализацию не выполняет — остатки
-	чинит старт (Т4 прокси, Т5 сироты с маркером).
+	соло-восстановление; канал-фикстура onec_db процессов не поднимает —
+	ей в реестре нечего носить); перед kill — сверка File= в cmdline,
+	чтобы не гасить чужой процесс под переиспользованным pid. Гасится и
+	на зелёном сеансе: сеанс не оставляет поднятых им клиентов — критерий
+	3 тикета падший прогон не называет. Прокси не гасится никогда —
+	общий на проект (решение владельца #37). Граница: kill -9 самого
+	pytest финализацию не выполняет; зомби-прокси и сироты останутся до
+	следующего старта (Т4/Т5 юнита #56 — впереди).
 	"""
 	_finalize_clients()
 

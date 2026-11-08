@@ -3,10 +3,10 @@
 Критерии тикета процессами: после падшего сеанса клиентов сеанса в
 /proc нет (pgrep-эквивалент — обход /proc по File=), прокси переживает
 финализацию, из клиентов одной базы гасится только поднятый фикстурой
-(«чужой» жив). Плюс правило гашения (добивание SIGKILL упрямому),
-семантика перечня (зелёный сеанс гасит поднятых им; сеанс без соло не
-гасит ничего), инвариант вывода (Usr/Pwd из cmdline клиента не
-всплывают) и юнит-проверки реестра.
+(«чужой» жив). Плюс правило гашения (TERM доставлен и проигнорирован,
+затем SIGKILL), семантика перечня (зелёный сеанс гасит поднятых им;
+сеанс без соло не гасит ничего), инвариант вывода (Usr/Pwd из cmdline
+клиента не всплывают) и юнит-проверки реестра.
 
 Клиент и прокси — настоящие спящие процессы; скрипт контура — фейк,
 который гасит/поднимает настоящий процесс с File= и Usr/Pwd в cmdline
@@ -14,6 +14,10 @@
 subprocess с PYTHONPATH этого дерева и явной загрузкой плагина
 (``-p onec_db.plugin``, автозагрузка отключена — канон test_solo_base).
 env сеансов герметичен по ONEC_DB_URL.
+
+Приватные имена плагина импортируются внутри юнит-тестов, не сверху:
+на базовом коммите (финализации нет) процессные тесты обязаны собираться
+и падать поведенчески, а не срубаться ImportError'ом всего файла.
 """
 import os
 import subprocess
@@ -21,9 +25,6 @@ import time
 from pathlib import Path
 
 import pytest
-
-from onec_db.plugin import _SESSION_CLIENTS, _finalize_clients, \
-	_solo_base_restore
 
 from test_solo_base import (alive_proc, reap, run_pytest, sleeper,
                             write_test)
@@ -40,6 +41,7 @@ printf '%s\\n' "$*" >> "$LOG"
 ROOT="$1"; shift
 CMD="${{1:-}}"; [ $# -gt 0 ] && shift
 IB="$(readlink -f "$ROOT/build/ib")"
+TERM_MARK="${{FAKE_TERM_MARKER:-/nonexistent}}"
 if [ "$CMD" = "--stop" ]; then
 	if [ -f "$CLIENT" ] && kill -0 "$(cat "$CLIENT")" 2>/dev/null; then
 		PID="$(cat "$CLIENT")"; kill "$PID"
@@ -53,16 +55,17 @@ if [ "$CMD" = "--stop" ]; then
 	fi
 else
 	# редирект обязателен: наследованный stdout держит pipe родителя,
-	# и subprocess.run ждёт смерти «клиента» вместо завершения (Т2);
-	# FAKE_STUBBORN=1 — клиент, игнорирующий SIGTERM (ветка добивания)
+	# и subprocess.run ждёт смерти «клиента» вместо завершения (Т2).
+	# FAKE_STUBBORN=1 — клиент, который TERM ловит маркером и игнорирует
+	# (ветка добивания SIGKILL): TERM_MARK — куда положить доказательство
 	if [ "${{FAKE_STUBBORN:-}}" = "1" ]; then
-		setsid sh -c 'trap "" TERM; while :; do sleep 1; done' \\
+		setsid sh -c 'trap "touch \\"\\$2\\"" TERM; while :; do sleep 1; done' \\
 			onec-db-fake-client "File=$IB;Usr=demo;Pwd=sekret" \\
-			>/dev/null 2>&1 &
+			"$TERM_MARK" >/dev/null 2>&1 &
 	else
 		setsid sh -c 'while :; do sleep 1; done' \\
 			onec-db-fake-client "File=$IB;Usr=demo;Pwd=sekret" \\
-			>/dev/null 2>&1 &
+			"$TERM_MARK" >/dev/null 2>&1 &
 	fi
 	echo "$!" > "$CLIENT"
 	echo "• клиент запущен (pid $(cat "$CLIENT")); лог: /tmp/none.log"
@@ -96,9 +99,12 @@ GREEN_MODULE = "def test_passes(solo_base):\n    assert True\n"
 PLAIN_MODULE = "def test_plain_without_fixtures():\n    assert True\n"
 
 
-@pytest.fixture(autouse=True)
-def _clean_registry():
-	"""Реестр — глобальное состояние модуля плагина: изоляция тестов."""
+@pytest.fixture()
+def clean_registry():
+	"""Реестр — глобальное состояние модуля плагина: изоляция юнитов.
+	Только им (процессные тесты живут в собственных subprocess-сеансах с
+	чистым реестром); НЕ autouse, чтобы на базовом коммите собрать файл."""
+	from onec_db.plugin import _SESSION_CLIENTS
 	_SESSION_CLIENTS.clear()
 	yield
 	_SESSION_CLIENTS.clear()
@@ -123,12 +129,11 @@ def make_project(tmp: Path, url: str) -> Path:
 	return root.resolve()  # realpath: база ожиданий строится от него
 
 
-def raise_client(root: Path, stubborn: bool = False):
+def raise_client(root: Path):
 	"""Клиент стенда до сеанса — поднят фейком (cmdline с File=)."""
-	env = dict(os.environ, FAKE_STUBBORN="1") if stubborn else None
 	subprocess.run(["bash", str(root / ".zcode" / "1c" / "scripts"
 	                            / "start_1c_db.sh"), str(root)],
-	               capture_output=True, check=True, env=env)
+	               capture_output=True, check=True)
 
 
 def alive_pid(pid: int) -> bool:
@@ -139,10 +144,20 @@ def alive_pid(pid: int) -> bool:
 	return st.rsplit(")", 1)[-1].split()[0] != "Z"
 
 
+def pidfile_pid(pidfile: Path):
+	"""pid из pid-файла фейка или None."""
+	try:
+		return int(pidfile.read_text())
+	except (OSError, ValueError):
+		return None
+
+
 def scan_file_clients(base: Path) -> set:
-	"""pgrep-эквивалент по правилу Т1: обход /proc, матч File= до «;»,
-	обе стороны realpath."""
-	target = os.path.realpath(str(base))
+	"""pgrep-эквивалент по тикету: обход /proc. Матч — сырой аргумент
+	cmdline с префиксом ``File=<realpath базы>;``: контракт записи фейка
+	(он печатает клиента ровно таким аргументом), без разбора строки —
+	оракул не клонирует парсер плагина."""
+	target = f"File={os.path.realpath(str(base))};"
 	found = set()
 	for name in os.listdir("/proc"):
 		if not name.isdigit():
@@ -152,15 +167,9 @@ def scan_file_clients(base: Path) -> set:
 		except OSError:
 			continue
 		for arg in raw.split(b"\0"):
-			for part in arg.decode("utf-8", "replace").split(";"):
-				if part.lower().startswith("file="):
-					val = part[5:].strip().strip('"')
-					if val and os.path.realpath(val) == target:
-						found.add(int(name))
-					break  # File= один на аргумент (канон stop_base_py)
-			else:
-				continue
-			break
+			if arg.decode("utf-8", "replace").startswith(target):
+				found.add(int(name))
+				break
 	return found
 
 
@@ -188,35 +197,52 @@ def test_fallen_session_leaves_no_clients(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
 	base = root / "build" / "ib"
 	raise_client(root)
+	client = tmp_path / "client.pid"
+	pid_a = pidfile_pid(client)  # клиент до сеанса: setup погасит его
+	assert pid_a is not None
 	falling = write_test(root, "test_fin_f.py", FALLING_MODULE)
 	try:
 		r = run_pytest(root, falling)
 		assert r.returncode == 1 and "assert False" in r.stdout, \
 			f"rc={r.returncode}, out={r.stdout[-400:]!r}"
+		# положительный контроль восстановления: в pid-файле ДРУГОЙ pid —
+		# фикстура реально поднимала клиента (иначе тест ниже вырождается)
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			f"restore не поднимал клиента: pid-файл не сменился ({pid_b})"
+		# поднятый фикстурой погашен финализацией…
+		assert not alive_pid(pid_b), \
+			f"поднятый фикстурой клиент {pid_b} пережил сеанс"
+		# …и по базе в /proc пусто (pgrep-эквивалент тикета)
 		left = wait_scan_empty(base)
 		assert not left, f"после сеанса живы клиенты базы: {left}"
 		# доказательство, что погасила финализация плагина, а не пустой стенд
 		assert "финализация сеанса" in r.stderr, r.stderr
-		assert "остановлено: 1" in r.stderr, r.stderr
 	finally:
-		kill_pidfile(tmp_path / "client.pid")
+		kill_pidfile(client)
 
 
 # ── критерий 2: прокси финализация не трогает ──
 
 def test_proxy_survives_finalization(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
+	base = root / "build" / "ib"
 	raise_client(root)
-	proxy = sleeper()  # прокси: без File= в cmdline — вне реестра по построению
+	# мок прокси: cmdline несёт имя и порт настоящего прокси (без File=) —
+	# широкое гашение по имени/порту зацепило бы его, если бы плагин так гасил
+	proxy = subprocess.Popen(
+		["sh", "-c", "while :; do sleep 1; done", "onec-mcp-proxy-mock",
+		 "python", "-m", "onec_mcp_toolkit_proxy", "--port", "6003"])
 	falling = write_test(root, "test_fin_p.py", FALLING_MODULE)
 	try:
 		r = run_pytest(root, falling)
 		assert r.returncode == 1, r.stdout[-300:]
-		# финализация точно выполнялась (на базовом дереве её нет —
-		# тест красный вместе с критерием 1)
-		assert "финализация сеанса" in r.stderr, r.stderr
+		# поведенческий маркер финализации: клиентов базы в /proc нет
+		assert wait_scan_empty(base) == set(), "клиенты базы пережили сеанс"
 		assert alive_pid(proxy.pid), \
 			"прокси пережить финализацию сеанса не смог"
+		# и это была финализация плагина, не пустой стенд
+		assert "финализация сеанса" in r.stderr, r.stderr
 	finally:
 		reap(proxy)
 		kill_pidfile(tmp_path / "client.pid")
@@ -228,6 +254,9 @@ def test_solo_raised_killed_stranger_kept(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
 	base = root / "build" / "ib"
 	raise_client(root)  # клиент до сеанса: setup погасит, restore поднимет
+	client = tmp_path / "client.pid"
+	pid_a = pidfile_pid(client)
+	assert pid_a is not None
 	stranger_pidfile = tmp_path / "stranger.pid"
 	falling = write_test(root, "test_fin_s.py", FALLING_MODULE)
 	try:
@@ -236,7 +265,14 @@ def test_solo_raised_killed_stranger_kept(tmp_path):
 		assert r.returncode == 1, r.stdout[-300:]
 		assert stranger_pidfile.exists(), "чужой клиент не поднят тестом"
 		stranger = int(stranger_pidfile.read_text())
-		# после сеанса на базе жив ровно чужой: поднятый фикстурой погашен
+		# положительный контроль: поднятый фикстурой клиент (другой pid,
+		# restore перезаписал pid-файл) погашен
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			f"restore не поднимал клиента: pid-файл не сменился ({pid_b})"
+		assert not alive_pid(pid_b), \
+			f"поднятый фикстурой клиент {pid_b} пережил сеанс"
+		# на базе жив ровно чужой
 		left = wait_scan_empty(base)
 		assert left == {stranger}, \
 			f"ожидался живым только чужой {stranger}, /proc несёт {left}"
@@ -245,25 +281,36 @@ def test_solo_raised_killed_stranger_kept(tmp_path):
 		if stranger_pidfile.exists():
 			stranger = stranger_pidfile.read_text().strip()
 			subprocess.run(["kill", "-9", stranger], capture_output=True)
-		kill_pidfile(tmp_path / "client.pid")
+		kill_pidfile(client)
 
 
-# ── правило гашения: упрямый клиент добивается SIGKILL ──
+# ── правило гашения: упрямый клиент — TERM доставлен и проигнорирован,
+# затем добивание SIGKILL ──
 
 def test_stubborn_client_gets_sigkill(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
 	base = root / "build" / "ib"
 	raise_client(root)  # обычный: setup погасит, restore поднимет упрямого
+	client = tmp_path / "client.pid"
+	pid_a = pidfile_pid(client)
+	assert pid_a is not None
+	term_mark = tmp_path / "term.delivered"
 	falling = write_test(root, "test_fin_k.py", FALLING_MODULE)
 	try:
-		r = run_pytest(root, falling, extra_env={"FAKE_STUBBORN": "1"})
+		env = {"FAKE_STUBBORN": "1", "FAKE_TERM_MARKER": str(term_mark)}
+		r = run_pytest(root, falling, extra_env=env)
 		assert r.returncode == 1, r.stdout[-300:]
-		# упрямый игнорирует SIGTERM — пережил бы без добивания
+		# положительный контроль: TERM до упрямого доставлен (маркер
+		# trap'а) — и он всё равно мёртв, то есть было добивание SIGKILL
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			f"restore не поднимал упрямого клиента ({pid_b})"
+		assert term_mark.exists(), "SIGTERM до клиента не доставлен"
 		assert wait_scan_empty(base, timeout=5.0) == set(), \
 			"упрямый клиент пережил финализацию"
-		assert "добиваю" in r.stderr, r.stderr
+		assert not alive_pid(pid_b)
 	finally:
-		kill_pidfile(tmp_path / "client.pid")
+		kill_pidfile(client)
 
 
 # ── семантика перечня: зелёный сеанс тоже гасит поднятых им ──
@@ -272,15 +319,23 @@ def test_green_session_also_finalizes(tmp_path):
 	root = make_project(tmp_path, url="http://127.0.0.1:6003/mcp")
 	base = root / "build" / "ib"
 	raise_client(root)
+	client = tmp_path / "client.pid"
+	pid_a = pidfile_pid(client)
+	assert pid_a is not None
 	green = write_test(root, "test_fin_g.py", GREEN_MODULE)
 	try:
 		r = run_pytest(root, green)
 		assert r.returncode == 0, r.stdout + r.stderr
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			f"restore не поднимал клиента ({pid_b})"
+		assert not alive_pid(pid_b), \
+			"зелёный сеанс оставил поднятого им клиента"
 		assert wait_scan_empty(base) == set(), \
 			"зелёный сеанс оставил поднятого им клиента"
 		assert "финализация сеанса" in r.stderr, r.stderr
 	finally:
-		kill_pidfile(tmp_path / "client.pid")
+		kill_pidfile(client)
 
 
 # ── граница перечня: сеанс без соло ничего не гасит ──
@@ -290,11 +345,13 @@ def test_plain_session_touches_nothing(tmp_path):
 	base = root / "build" / "ib"
 	raise_client(root)
 	client = tmp_path / "client.pid"
+	pid_a = pidfile_pid(client)
+	assert pid_a is not None
 	plain = write_test(root, "test_fin_n.py", PLAIN_MODULE)
 	try:
 		r = run_pytest(root, plain)
 		assert r.returncode == 0, r.stdout + r.stderr
-		assert alive_proc(client), \
+		assert alive_pid(pid_a), \
 			"финализация погасила клиента, которого сеанс не поднимал"
 		assert scan_file_clients(base), "клиент исчез из /proc"
 		assert "финализация" not in r.stderr, r.stderr
@@ -312,18 +369,19 @@ def test_output_masks_creds(tmp_path):
 	try:
 		env = {"STRANGER_PID": str(stranger_pidfile),
 		       "SOLO_IB": str(root / "build" / "ib")}
-		r = run_pytest(root, falling, extra_env=env)
+		# --tb=no: отчёт pytest не печатает исходник падающего теста с его
+		# литералами — инвариант покрывает оба потока, как критерий Т1
+		r = run_pytest(root, falling, extra_env=env,
+		               pytest_args=("--tb=no",))
 		assert r.returncode == 1, r.stdout[-300:]
 		# cmdline клиентов несёт Usr=demo;Pwd=sekret (фейк) и
-		# Usr=stranger;Pwd=strangerpw (чужой); инвариант — про вывод
-		# ПОСТАВКИ: канал плагина — stderr (stdout занят отчётом pytest,
-		# который печатает исходник самого падающего теста с его
-		# литералами — это автор теста, не поставка)
-		leaked = r.stderr
+		# Usr=stranger;Pwd=strangerpw (чужой) — в выводе поставки их нет
+		leaked = r.stdout + r.stderr
 		assert "Pwd=" not in leaked, leaked[-400:]
 		assert "Usr=" not in leaked, leaked[-400:]
 		assert "sekret" not in leaked and "strangerpw" not in leaked, \
 			leaked[-400:]
+		assert "финализация сеанса" in r.stderr, r.stderr
 	finally:
 		if stranger_pidfile.exists():
 			stranger = stranger_pidfile.read_text().strip()
@@ -331,20 +389,29 @@ def test_output_masks_creds(tmp_path):
 		kill_pidfile(tmp_path / "client.pid")
 
 
-# ── юниты реестра (in-process) ──
+# ── юниты реестра (in-process; импорты внутри — краснота на базе не
+#    срубается ImportError'ом файла, а остаётся поведенческой) ──
 
-def test_registry_skips_reused_pid(tmp_path):
-	# pid переиспользован процессом без File= той базы — чужое не гасится
-	proc = sleeper()
+def test_registry_skips_reused_pid(tmp_path, clean_registry):
+	# pid переиспользован процессом, чей cmdline несёт ДРУГУЮ базу —
+	# чужое не гасится (реализация, гасящая любой File=, провалит тест)
+	from onec_db.plugin import _SESSION_CLIENTS, _finalize_clients
+	other_base = tmp_path / "other" / "ib"
+	other_base.mkdir(parents=True)
+	proc = subprocess.Popen(
+		["sh", "-c", "while :; do sleep 1; done", "onec-db-fake-client",
+		 f"File={other_base};Usr=other;Pwd=otherpw"])
 	try:
-		_SESSION_CLIENTS.append((proc.pid, str(tmp_path / "elsewhere")))
+		_SESSION_CLIENTS.append((proc.pid, str(tmp_path / "expected" / "ib")))
 		assert _finalize_clients() == []
-		assert proc.poll() is None, "погашен чужой процесс под тем же pid"
+		assert proc.poll() is None, \
+			"погашен чужой клиент другой базы под тем же pid"
 	finally:
 		reap(proc)
 
 
-def test_finalize_clears_registry(tmp_path):
+def test_finalize_clears_registry(tmp_path, clean_registry):
+	from onec_db.plugin import _SESSION_CLIENTS, _finalize_clients
 	victim = sleeper()
 	victim.kill()
 	victim.wait()  # гарантированно мёртвый pid
@@ -353,9 +420,10 @@ def test_finalize_clears_registry(tmp_path):
 	assert _SESSION_CLIENTS == [], "реестр не очищен после финализации"
 
 
-def test_restore_without_pid_line_warns(tmp_path, capsys):
+def test_restore_without_pid_line_warns(tmp_path, capsys, clean_registry):
 	# старт поднял клиента, но не назвал pid — финализация его не погасит:
 	# громкое предупреждение, реестр пуст
+	from onec_db.plugin import _SESSION_CLIENTS, _solo_base_restore
 	mini = tmp_path / "start_1c_db.sh"
 	mini.write_text(
 		"#!/bin/sh\n"
@@ -372,6 +440,38 @@ def test_restore_without_pid_line_warns(tmp_path, capsys):
 		captured = capsys.readouterr()
 		assert "не назвал pid" in captured.err, captured.err
 		assert len(_SESSION_CLIENTS) == before, "немой старт попал в реестр"
+	finally:
+		raised = tmp_path / "raised.pid"
+		if raised.exists():
+			subprocess.run(["kill", "-9", raised.read_text().strip()],
+			               capture_output=True)
+
+
+def test_restore_failure_still_registers_client(tmp_path, clean_registry):
+	# restore не прошёл (rc != 0), но pid напечатан контрактом ДО падения:
+	# клиент мог подняться — сеанс не оставляет его без реестра, а ошибка
+	# остаётся громкой (финализация в конце сеанса погасит поднятого)
+	from onec_db.plugin import _SESSION_CLIENTS, _solo_base_restore
+	mini = tmp_path / "start_1c_db.sh"
+	mini.write_text(
+		"#!/bin/sh\n"
+		"sh -c 'while :; do sleep 1; done' onec-db-fake-client "
+		">/dev/null 2>&1 &\n"
+		'echo $! > "$1/raised.pid"\n'
+		'echo "• клиент запущен (pid $(cat "$1/raised.pid"))"\n'
+		'echo "фаза ожидания не дождалась" >&2\n'
+		"exit 1\n", encoding="utf-8")
+	mini.chmod(0o755)
+	ib = tmp_path / "ib"
+	ib.mkdir()
+	state = {"script": mini, "root": tmp_path, "instance": "",
+	         "had_client": True, "file": str(ib)}
+	try:
+		with pytest.raises(RuntimeError, match="не прошло"):
+			_solo_base_restore(state)
+		raised = int((tmp_path / "raised.pid").read_text())
+		assert (raised, str(ib)) in _SESSION_CLIENTS, \
+			"поднятый при неудавшемся restore клиент без реестра"
 	finally:
 		raised = tmp_path / "raised.pid"
 		if raised.exists():
