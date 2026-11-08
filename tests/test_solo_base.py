@@ -7,11 +7,15 @@ url разводит восстановление mono/``--instance`` (гаше�
 по строке соединения записи), клиента не было — восстановление не звалось.
 
 Клиент и прокси — настоящие спящие процессы; скрипт контура — фейк,
-который гасит/поднимает настоящий процесс и логирует argv. pytest-сеансы
-— subprocess с PYTHONPATH этого дерева и явной загрузкой плагина
-(``-p onec_db.plugin``): dev-venv держит editable-установку другого
-каталога, ворктри-прогон не должен её видеть. env сеансов герметичен
-по ONEC_DB_URL — штатная практика ворктри не должна менять резолв.
+который гасит/поднимает настоящий процесс и логирует argv. Клиент фейка
+несёт ``File=<база>;Usr=…;Pwd=…`` в cmdline — как поднимает настоящий
+скрипт, поэтому гвард финализации сеанса (юнит #56 Т3) узнаёт его:
+в конце сеанса sessionfinish гасит поднятого фикстурой, и «клиент
+восстановлен» доказывается сменой pid-файла + мёртвым поднятым pid,
+а не живостью после сеанса. pytest-сеансы — subprocess с PYTHONPATH
+этого дерева и явной загрузкой плагина (``-p onec_db.plugin``):
+dev-venv держит editable-установку другого каталога, ворктри-прогон
+не должен её видеть. env сеансов герметичен по ONEC_DB_URL.
 """
 import os
 import subprocess
@@ -27,12 +31,15 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = str(REPO / "src")
 
 FAKE_SCRIPT = """#!/bin/sh
-# фейк start_1c_db.sh: лог argv, «клиент» — настоящий спящий процесс
+# фейк start_1c_db.sh: лог argv; «клиент» — настоящий спящий процесс
+# с File=<база>;Usr=…;Pwd=… в cmdline (как поднимает настоящий скрипт);
+# FAKE_IB переопределяет базу — у инстанса она отлична от привязки дерева
 LOG="{log}"
 CLIENT="{pidfile}"
 printf '%s\\n' "$*" >> "$LOG"
 ROOT="$1"; shift
 CMD="${{1:-}}"; [ $# -gt 0 ] && shift
+IB="$(readlink -f "${{FAKE_IB:-$ROOT/build/ib}}")"
 if [ "$CMD" = "--stop" ]; then
 	if [ -f "$CLIENT" ] && kill -0 "$(cat "$CLIENT")" 2>/dev/null; then
 		PID="$(cat "$CLIENT")"; kill "$PID"
@@ -47,7 +54,8 @@ if [ "$CMD" = "--stop" ]; then
 else
 	# редирект обязателен: наследованный stdout держит pipe родителя,
 	# и subprocess.run ждёт смерти «клиента» вместо завершения
-	sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+	sh -c 'while :; do sleep 1; done' onec-fake-client \\
+		"File=$IB;Usr=demo;Pwd=demopw" >/dev/null 2>&1 &
 	echo "$!" > "$CLIENT"
 	echo "• клиент запущен (pid $(cat "$CLIENT"))"
 fi
@@ -125,11 +133,22 @@ def alive_proc(pidfile: Path) -> bool:
 		pid = int(pidfile.read_text())
 	except Exception:
 		return False
+	return alive_pid(pid)
+
+
+def alive_pid(pid: int) -> bool:
 	try:
 		st = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
 	except OSError:
 		return False
 	return st.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def pidfile_pid(pidfile: Path):
+	try:
+		return int(pidfile.read_text())
+	except (OSError, ValueError):
+		return None
 
 
 def sleeper() -> subprocess.Popen:
@@ -209,13 +228,21 @@ def test_solo_module_guards_and_restores(tmp_path):
 		client = Path(tmp_path / "client.pid")
 		proxy_pid = Path(tmp_path / "proxy.pid")
 		proxy_pid.write_text(f"{proxy.pid}\n")
+		pid_a = pidfile_pid(client)
+		assert pid_a is not None
 		env = {"SOLO_CLIENT_PID": str(client),
 		       "SOLO_PROXY_PID": str(proxy_pid)}
 
 		r1 = run_pytest(root, solo, extra_env=env)
 		assert r1.returncode == 0, r1.stdout + r1.stderr
-		# после сеанса: клиент поднят обратно, прокси жив
-		assert alive_proc(client), "клиент не восстановлен после соло-модуля"
+		# восстановление поднимало клиента (pid-файл сменился); в конце
+		# сеанса поднятого гасит финализация плагина (Т3) — сеанс не
+		# оставляет поднятых им клиентов
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			f"restore не поднимал клиента (pid-файл: {pid_b})"
+		assert not alive_pid(pid_b), \
+			"поднятый фикстурой клиент пережил сеанс — финализация не сработала"
 		assert alive_proc(proxy_pid), "прокси пережить соло-модуль не смог"
 
 		# гашение — по строке соединения привязки дерева, без --instance;
@@ -226,22 +253,36 @@ def test_solo_module_guards_and_restores(tmp_path):
 		assert log[1] == f"{root} --stop --base {expected_conn}", log[1]
 		assert log[2] == str(root), log[2]  # mono: без --instance
 
-		# исход «тест упал ассертом» — тот же результат: клиент поднят
+		# исход «тест упал ассертом» — тот же результат: финализация
+		# прошлого сеанса стенд опустошила, клиента поднимаем заново
+		raise_client(root)
+		pid_a2 = pidfile_pid(client)
+		assert pid_a2 is not None and pid_a2 != pid_b
 		failing = write_test(root, "test_solo_b.py", FAILING_MODULE)
 		r2 = run_pytest(root, failing, extra_env=env)
 		assert r2.returncode == 1 and "assert False" in r2.stdout, \
 			f"rc={r2.returncode}, out={r2.stdout[-600:]!r}, err={r2.stderr[-200:]!r}"
-		assert alive_proc(client), "падший прогон не восстановил клиента"
+		pid_c = pidfile_pid(client)
+		assert pid_c is not None and pid_c != pid_a2, \
+			"падший прогон не восстановил клиента"
+		assert not alive_pid(pid_c), "поднятый пережил сеанс"
 		assert alive_proc(proxy_pid), "прокси погиб на падшем прогоне"
 
 		# второй pytest-сеанс на той же базе не зависит: клиент, поднятый
 		# восстановлением, гасится снова («остановлено», не «не найдено»)
+		raise_client(root)
+		pid_a3 = pidfile_pid(client)
+		assert pid_a3 is not None and pid_a3 != pid_c
 		r3 = run_pytest(root, solo, extra_env=env)
 		assert r3.returncode == 0, \
 			f"rc={r3.returncode}, out={r3.stdout[-600:]!r}, err={r3.stderr[-200:]!r}"
-		assert alive_proc(client) and alive_proc(proxy_pid)
+		pid_d = pidfile_pid(client)
+		assert pid_d is not None and pid_d != pid_a3
+		assert not alive_pid(pid_d)
+		assert alive_proc(proxy_pid)
 		log = calls(tmp_path / "calls.log")
-		assert len(log) == 7, (log, r2.stdout[-400:], r3.stdout[-400:])
+		# 3 × raise_client + (stop, restore) × 3 сеанса
+		assert len(log) == 9, (log, r2.stdout[-400:], r3.stdout[-400:])
 		assert "не найдено" not in "\n".join(log), log
 	finally:
 		reap(proxy)
@@ -292,10 +333,16 @@ def test_autofixture_reaches_first_plain_test(tmp_path):
 	try:
 		raise_client(root)
 		client = Path(tmp_path / "client.pid")
+		pid_a = pidfile_pid(client)
+		assert pid_a is not None
 		r = run_pytest(root, solo,
 		               extra_env={"SOLO_CLIENT_PID": str(client)})
 		assert r.returncode == 0, r.stdout + r.stderr
-		assert alive_proc(client), "клиент не восстановлен после соло-модуля"
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			"restore не поднимал клиента"
+		assert not alive_pid(pid_b), \
+			"поднятый фикстурой клиент пережил сеанс — финализация не сработала"
 		assert len(calls(tmp_path / "calls.log")) == 3
 	finally:
 		if (tmp_path / "client.pid").exists():
@@ -316,11 +363,16 @@ def test_channel_resolves_instance_restore(tmp_path):
 	solo = write_test(root, "test_solo_d.py", SOLO_MODULE)
 	raise_client(root)
 	client = Path(tmp_path / "client.pid")
+	pid_a = pidfile_pid(client)
+	assert pid_a is not None
 	proxy = sleeper()
 	(tmp_path / "proxy.pid").write_text(f"{proxy.pid}\n")
 	try:
 		env = {"SOLO_CLIENT_PID": str(client),
-		       "SOLO_PROXY_PID": str(tmp_path / "proxy.pid")}
+		       "SOLO_PROXY_PID": str(tmp_path / "proxy.pid"),
+		       # поднятый по --instance клиент несёт базу записи инстанса,
+		       # не привязку дерева — как поднимает настоящий скрипт
+		       "FAKE_IB": str(root / "build" / "ib" / "s1")}
 		r = run_pytest(root, solo, extra_env=env)
 		assert r.returncode == 0, r.stdout + r.stderr
 		log = calls(tmp_path / "calls.log")
@@ -330,7 +382,11 @@ def test_channel_resolves_instance_restore(tmp_path):
 		# отлична от привязки дерева), --instance только в подъеме
 		assert log[1] == f"{root} --stop --base {expected_conn}", log[1]
 		assert log[2] == f"{root} --instance solo1", log[2]
-		assert alive_proc(client)
+		pid_b = pidfile_pid(client)
+		assert pid_b is not None and pid_b != pid_a, \
+			"restore не поднимал клиента инстанса"
+		assert not alive_pid(pid_b), \
+			"поднятый фикстурой клиент пережил сеанс — финализация не сработала"
 		assert alive_proc(tmp_path / "proxy.pid"), "прокси пережить модуль не смог"
 	finally:
 		reap(proxy)
@@ -352,9 +408,11 @@ def test_channel_without_instance_fails_loud(tmp_path):
 		r = run_pytest(root, solo)
 		assert r.returncode != 0
 		assert "нет инстанса с этим каналом" in r.stdout, r.stdout
-		# отказ ДО гашения — клиент не тронут
+		# отказ ДО гашения — клиент не тронут; реестр пуст, финализации
+		# сеанса нечего гасить
 		assert alive_proc(client)
 		assert calls(tmp_path / "calls.log") == [str(root)]  # только raise_client
+		assert "финализация" not in r.stderr, r.stderr
 	finally:
 		if client.exists():
 			subprocess.run(["kill", client.read_text().strip()],
