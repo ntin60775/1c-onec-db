@@ -26,8 +26,8 @@ from pathlib import Path
 
 import pytest
 
-from test_solo_base import (alive_proc, reap, run_pytest, sleeper,
-                            write_test)
+from test_solo_base import (alive_proc, package, reap, run_pytest,
+                            sleeper, write_test)
 
 # ── фейк скрипта контура: клиент несёт File=<база>;Usr=…;Pwd=… в cmdline ──
 
@@ -113,15 +113,15 @@ def clean_registry():
 def make_project(tmp: Path, url: str) -> Path:
 	"""Проект контура с фейком скрипта, поднимающим клиента с File=."""
 	root = tmp / "proj"
-	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / ".dsh" / "1c").mkdir(parents=True)
 	(root / "build" / "ib").mkdir(parents=True)
 	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
 	(root / "v8project.local.yaml").write_text(
 		"infobases:\n  origin:\n    connection: 'File=build/ib'\n",
 		encoding="utf-8")
-	(root / ".zcode" / "1c" / "contour.json").write_text(
+	(root / ".dsh" / "1c" / "contour.json").write_text(
 		f'{{"1c_db": {{"url": "{url}"}}}}', encoding="utf-8")
-	script = root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh"
+	script = package(tmp) / "start_1c_db.sh"
 	script.write_text(FAKE_SCRIPT.format(log=tmp / "calls.log",
 	                                     pidfile=tmp / "client.pid"),
 	                  encoding="utf-8")
@@ -131,7 +131,7 @@ def make_project(tmp: Path, url: str) -> Path:
 
 def raise_client(root: Path):
 	"""Клиент стенда до сеанса — поднят фейком (cmdline с File=)."""
-	subprocess.run(["bash", str(root / ".zcode" / "1c" / "scripts"
+	subprocess.run(["bash", str(root.parent / "pkg" / "scripts"
 	                            / "start_1c_db.sh"), str(root)],
 	               capture_output=True, check=True)
 

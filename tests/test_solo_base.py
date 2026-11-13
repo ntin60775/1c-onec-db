@@ -155,21 +155,28 @@ def sleeper() -> subprocess.Popen:
 	return subprocess.Popen(["sh", "-c", "while :; do sleep 1; done"])
 
 
+def package(tmp: Path) -> Path:
+	"""Пакет контура ($DSH_1C_ROOT): проект скрипты не вендорит (канон DSH)."""
+	package_scripts = tmp / "pkg" / "scripts"
+	package_scripts.mkdir(parents=True, exist_ok=True)
+	return package_scripts
+
+
 def make_project(tmp: Path, url: str, instances: str = "") -> Path:
 	"""Проект контура: привязка дерева, contour.json, фейк скрипта, инстансы."""
 	root = tmp / "proj"
-	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / ".dsh" / "1c").mkdir(parents=True)
 	(root / "build" / "ib").mkdir(parents=True)
 	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
 	(root / "v8project.local.yaml").write_text(
 		"infobases:\n  origin:\n    connection: 'File=build/ib'\n",
 		encoding="utf-8")
-	(root / ".zcode" / "1c" / "contour.json").write_text(
+	(root / ".dsh" / "1c" / "contour.json").write_text(
 		f'{{"1c_db": {{"url": "{url}"}}}}', encoding="utf-8")
 	if instances:
-		(root / ".zcode" / "1c" / "db-instances.yaml").write_text(
+		(root / ".dsh" / "1c" / "db-instances.yaml").write_text(
 			instances, encoding="utf-8")
-	script = root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh"
+	script = package(tmp) / "start_1c_db.sh"
 	script.write_text(FAKE_SCRIPT.format(log=tmp / "calls.log",
 	                                     pidfile=tmp / "client.pid"),
 	                  encoding="utf-8")
@@ -179,7 +186,8 @@ def make_project(tmp: Path, url: str, instances: str = "") -> Path:
 
 def run_pytest(root: Path, *test_files: Path, extra_env: dict = None,
                pytest_args: tuple = ()):
-	env = dict(os.environ, PYTHONPATH=SRC)
+	env = dict(os.environ, PYTHONPATH=SRC,
+	           DSH_1C_ROOT=str(root.parent / "pkg"))
 	env.pop("ONEC_DB_URL", None)  # герметичность: url задаёт contour.json
 	# автозагрузка entry-points прочь: при установленном пакете (system/site)
 	# entry-point «onec_db» и явный «-p onec_db.plugin» зарегистрируют один
@@ -202,7 +210,7 @@ def write_test(root: Path, name: str, body: str) -> Path:
 
 def raise_client(root: Path):
 	# «клиент был до гашения»: старт фейком — настоящий спящий процесс
-	subprocess.run(["bash", str(root / ".zcode" / "1c" / "scripts"
+	subprocess.run(["bash", str(root.parent / "pkg" / "scripts"
 	                            / "start_1c_db.sh"), str(root)],
 	               capture_output=True, check=True)
 
@@ -423,7 +431,7 @@ def test_channel_without_instance_fails_loud(tmp_path):
 
 def _project_min(tmp: Path, connection: str) -> Path:
 	root = tmp / "proj"
-	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / ".dsh" / "1c").mkdir(parents=True)
 	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
 	(root / "v8project.local.yaml").write_text(
 		"infobases:\n  origin:\n"
@@ -439,7 +447,8 @@ def test_setup_fails_without_contour_root(tmp_path, monkeypatch):
 
 def test_setup_fails_without_script(tmp_path, monkeypatch):
 	root = _project_min(tmp_path, "File=build/ib")
-	monkeypatch.chdir(root)  # скрипт .zcode/1c/scripts не доставлен
+	monkeypatch.chdir(root)
+	monkeypatch.delenv("DSH_1C_ROOT", raising=False)  # пакета нет — скрипта нет
 	with pytest.raises(RuntimeError, match="скриптом контура"):
 		_solo_base_setup()
 
@@ -447,19 +456,19 @@ def test_setup_fails_without_script(tmp_path, monkeypatch):
 def test_setup_fails_on_server_base(tmp_path, monkeypatch):
 	root = _project_min(tmp_path, "Srvr=srv-01;Ref=demo_base")
 	monkeypatch.chdir(root)
-	(root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh").write_text(
-		"", encoding="utf-8")
+	(package(tmp_path) / "start_1c_db.sh").write_text("", encoding="utf-8")
+	monkeypatch.setenv("DSH_1C_ROOT", str(tmp_path / "pkg"))
 	with pytest.raises(RuntimeError, match="файловых баз"):
 		_solo_base_setup()
 
 
 def test_setup_fails_without_binding(tmp_path, monkeypatch):
 	root = tmp_path / "proj"
-	(root / ".zcode" / "1c" / "scripts").mkdir(parents=True)
+	(root / ".dsh" / "1c").mkdir(parents=True)
 	(root / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
 	monkeypatch.chdir(root)
-	(root / ".zcode" / "1c" / "scripts" / "start_1c_db.sh").write_text(
-		"", encoding="utf-8")
+	(package(tmp_path) / "start_1c_db.sh").write_text("", encoding="utf-8")
+	monkeypatch.setenv("DSH_1C_ROOT", str(tmp_path / "pkg"))
 	with pytest.raises(RuntimeError, match="привязка базы не найдена"):
 		_solo_base_setup()
 
@@ -475,7 +484,7 @@ def test_channel_from_url_variants():
 
 
 def test_instance_for_channel_defaults_to_name(tmp_path):
-	cfg = tmp_path / ".zcode" / "1c" / "db-instances.yaml"
+	cfg = tmp_path / ".dsh" / "1c" / "db-instances.yaml"
 	cfg.parent.mkdir(parents=True)
 	cfg.write_text(
 		"instances:\n"
@@ -494,7 +503,7 @@ def test_instance_for_channel_defaults_to_name(tmp_path):
 
 
 def test_instance_for_channel_indents_and_comments(tmp_path):
-	cfg = tmp_path / ".zcode" / "1c" / "db-instances.yaml"
+	cfg = tmp_path / ".dsh" / "1c" / "db-instances.yaml"
 	cfg.parent.mkdir(parents=True)
 	# отступ 4 (раннер берёт name_indent из первой вложенной) + комментарии
 	cfg.write_text(
@@ -512,7 +521,7 @@ def test_instance_for_channel_indents_and_comments(tmp_path):
 
 
 def test_instance_for_channel_ambiguous_fails_loud(tmp_path):
-	cfg = tmp_path / ".zcode" / "1c" / "db-instances.yaml"
+	cfg = tmp_path / ".dsh" / "1c" / "db-instances.yaml"
 	cfg.parent.mkdir(parents=True)
 	cfg.write_text(
 		"instances:\n"

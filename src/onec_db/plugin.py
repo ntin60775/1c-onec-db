@@ -2,10 +2,12 @@
 уровня логики 1С.
 
 После установки пакета фикстуры доступны во всех тестах без conftest.
-URL 1c-db: env ONEC_DB_URL → .zcode/1c/contour.json (1c_db.url) → дефолт
+URL 1c-db: env ONEC_DB_URL → contour.json канонной раскладки (`.dsh/1c`,
+затем промежуточная `.dsh`; локальный оверлей contour.local.json —
+фактический порт) → дефолт
 http://127.0.0.1:6003/mcp. Клиент 1c-db поднимает
-.zcode/1c/scripts/start_1c_db.sh контура; прод защищён mcp_gate —
-фикстуры только для тестовых деревьев.
+``$DSH_1C_ROOT/scripts/start_1c_db.sh`` пакета контура (проект скрипты не
+вендорит); прод защищён mcp_gate — фикстуры только для тестовых деревьев.
 
 Проба принадлежности базы: фикстура сверяет базу, которую отдаёт прокси
 (``СтрокаСоединенияИнформационнойБазы()``), с привязкой дерева из
@@ -22,16 +24,24 @@ local-слоя (v8project.local.yaml → v8project.yaml; ``File=`` / ``Srvr+Ref`
 ``e2e_solo`` — run_e2e делит выборку на сеансы по collect-only.
 
 Финализация сеанса (``pytest_sessionfinish``): клиенты, поднятые
-фикстурами плагина за сеанс (сегодня — соло-восстановление), гасятся в
+фикстурами плагина за сеанс (реестр заполняет соло-восстановление), гасятся в
 конце сеанса правилом гашения контура (короткие одиночные kill +
 перепроверка, добивание по pid). Перечень — реестр подъёмов, не
 cmdline-матч по базе: клиент, поднятый не фикстурами плагина (GUI-клиент
 testpilot, ручной старт), финализации не принадлежит — его гасят
-``--stop --base``; чистку сирот несёт старт контура (Т5 юнита #56,
-ещё не отгружен). Прокси финализация не гасит никогда (общий на
-проект); граница: kill -9 самого pytest финализацию не выполняет —
-зомби-прокси и сироты останутся до следующего старта (Т4/Т5 юнита
-#56, ещё не отгружены).
+``--stop --base``; сирот снимает старт контура (гигиена старта).
+Прокси финализация не гасит никогда (общий на проект); граница: kill -9
+самого pytest финализацию не выполняет — зомби-прокси и сироты останутся
+до следующего старта (автопочинка и гигиена старта).
+
+Диагностика канала (``onec_db``): канал не отвечает (в том числе таймаут
+канала — в логе тулкита «Timeout waiting for the 1C consumer») — к ошибке
+дописывается состояние стенда блоком
+``start_1c_db.sh --status``: процессы с базой в cmdline, владелец порта,
+лок ``1Cv8.1CL``, stand-замок. Usr/Pwd маскирует носитель сборки; своя
+копия сборки в плагине не заводится — блок зовётся у пакета контура.
+Недоступный скрипт и таймаут сборки называются в ошибке как пробел,
+исходная причина недоступности канала остаётся.
 """
 import json
 import os
@@ -51,6 +61,11 @@ __all__ = ["onec_db", "solo_base", "stub_server", "OnecDB", "StubServer"]
 
 _PROBE_CODE = "Результат = СтрокаСоединенияИнформационнойБазы();"
 _BASE_KEYS = ("File", "Srvr", "Ref")
+_DEFAULT_URL = "http://127.0.0.1:6003/mcp"
+
+# Раскладка проекта контура: порядок повторяет LAYOUT_DIRS src/paths.ts и
+# scripts/contour_paths.py (канон `.dsh/1c`, промежуточная `.dsh`).
+_LAYOUT_DIRS = (".dsh/1c", ".dsh")
 
 # Реестр клиентов, поднятых фикстурами плагина за сеанс (юнит #56 Т3):
 # пары (pid, путь базы). Носитель перечня — факт подъёма фикстурой, не
@@ -60,27 +75,83 @@ _SESSION_CLIENTS: list = []
 _CLIENT_PID_RE = re.compile(r"• клиент запущен \(pid (\d+)\)")
 
 
+def _layout_input(root, relative: str):
+	"""Вход контура в раскладке проекта: первый существующий файл или None."""
+	for name in _LAYOUT_DIRS:
+		path = pathlib.Path(root) / name / relative
+		if path.is_file():
+			return path
+	return None
+
+
+def _contour_script(name: str) -> pathlib.Path:
+	"""Скрипт контура из пакета: ``$DSH_1C_ROOT/scripts/<name>``.
+
+	Проект скрипты не вендорит (канон контура DSH): путь к пакету публикует
+	сессия, поэтому переменная обязательна — тихий фолбэк на копию в дереве
+	дал бы второй носитель скриптов.
+	"""
+	base = os.environ.get("DSH_1C_ROOT") or ""
+	if not base:
+		raise RuntimeError(
+			"DSH_1C_ROOT не задан — скрипты контура живут в пакете "
+			"($DSH_1C_ROOT/scripts), проект их не вендорит; запусти прогон "
+			"из сессии DSH или задай переменную")
+	path = pathlib.Path(base) / "scripts" / name
+	if not path.is_file():
+		raise RuntimeError(f"нет {path} — поставь пакет контура целиком")
+	return path
+
+
 def _resolve_url() -> str:
+	"""Адрес 1c-db: env → фактический url контура (с локальным оверлеем)."""
 	url = os.environ.get("ONEC_DB_URL")
 	if url:
 		return url
-	cfg = pathlib.Path(".zcode/1c/contour.json")
-	if cfg.is_file():
+	root = _find_root()
+	base = pathlib.Path(root) if root is not None else pathlib.Path.cwd()
+	contour = {}
+	path = _layout_input(base, "contour.json")
+	if path is not None:
 		try:
-			stored = json.loads(cfg.read_text(encoding="utf-8")) \
-				.get("1c_db", {}).get("url")
-			if stored:
-				return stored
-		except json.JSONDecodeError:
-			pass
-	return "http://127.0.0.1:6003/mcp"
+			contour = json.loads(path.read_text(encoding="utf-8"))
+		except (OSError, json.JSONDecodeError) as error:
+			# молчаливый фолбэк адресовал бы :6003 основного дерева — тихая
+			# запись в чужую базу; вход называем громко (канон контура)
+			print(f"onec_db: {path}: не разобран ({error}) — url беру по "
+			      "умолчанию, дрейф порта не учтён", file=sys.stderr)
+			contour = {}
+	section = contour.get("1c_db") if isinstance(contour, dict) else None
+	desired = (section.get("url") if isinstance(section, dict) else "") \
+		or _DEFAULT_URL
+	local = {}
+	path = _layout_input(base, "contour.local.json")
+	if path is not None:
+		try:
+			local = json.loads(path.read_text(encoding="utf-8"))
+		except (OSError, json.JSONDecodeError) as error:
+			print(f"onec_db: {path}: не разобран ({error}) — фактический "
+			      "порт прокси неизвестен, беру url из contour.json",
+			      file=sys.stderr)
+			local = {}
+	layer = local.get("1c_db") if isinstance(local, dict) else None
+	# Локальный слой применяется, пока желаемый url не менялся (дрейф порта
+	# мультистенда; та же семантика, что в контуре и start_1c_db.sh).
+	if isinstance(layer, dict) and layer.get("desired_url") == desired:
+		return layer.get("url") or desired
+	return desired
 
 
 def _find_root():
-	"""Корень проекта контура от cwd (v8project.yaml или .zcode/1c) или None."""
+	"""Корень проекта контура от cwd (v8project.yaml или .dsh/1c) или None.
+
+	Голый `.dsh` корнем не считается: это ещё и домашний каталог DSH —
+	подъём от cwd под $HOME вернул бы $HOME вместо проекта (канон контура:
+	корень — v8project.yaml либо канонная раскладка `.dsh/1c`).
+	"""
 	here = pathlib.Path.cwd()
 	for cand in (here, *here.parents):
-		if (cand / "v8project.yaml").is_file() or (cand / ".zcode" / "1c").is_dir():
+		if (cand / "v8project.yaml").is_file() or (cand / ".dsh" / "1c").is_dir():
 			return cand
 	return None
 
@@ -145,13 +216,23 @@ def _fmt_base(keys: dict) -> str:
 	return ";".join(f"{k}={keys[k]}" for k in _BASE_KEYS if k in keys)
 
 
+def _describe_connection(connection) -> str:
+	"""Строка соединения для текста ошибки: только несущие базу ключи.
+
+	Usr=/Pwd= в вывод плагина не попадают (инвариант контура: креды не
+	печатаются); нечего назвать — печатается факт, а не сама строка.
+	"""
+	base = _fmt_base(_conn_keys(str(connection)))
+	return base or "строка без File=/Srvr+Ref"
+
+
 def _assert_owns_base(client: OnecDB, url: str) -> None:
 	"""Проба принадлежности: база прокси = база дерева, иначе прогон не стартует."""
 	root = _find_root()
 	if root is None:
 		raise RuntimeError(
 			"onec_db: корень проекта контура не найден от cwd "
-			"(нет v8project.yaml и .zcode/1c) — принадлежность базы не сверить; "
+			"(нет v8project.yaml и .dsh/1c) — принадлежность базы не сверить; "
 			"запусти прогон из корня дерева")
 	expected_raw = _expected_connection(root)
 	if not expected_raw:
@@ -162,7 +243,8 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 	expected = _base_keys(expected_raw, root, resolve_relative=True)
 	if not expected:
 		raise RuntimeError(
-			f"onec_db: в привязке дерева нет File=/Srvr+Ref: {expected_raw!r}")
+			"onec_db: в привязке дерева нет File=/Srvr+Ref: "
+			f"{_describe_connection(expected_raw)}")
 	try:
 		actual_raw = client.execute(_PROBE_CODE)
 	except Exception as e:  # noqa: BLE001 — внятный фейл вместо трейса
@@ -173,7 +255,7 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 	if not actual:
 		raise RuntimeError(
 			f"onec_db: прокси {url} не отдал строку соединения, получено: "
-			f"{str(actual_raw)[:200]!r}")
+			f"{_describe_connection(actual_raw)}")
 	if expected != actual:
 		hint = ""
 		actual_file = _conn_keys(str(actual_raw)).get("File")
@@ -189,9 +271,62 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 			+ hint +
 			"Типовая ловушка git-ворктри: дефолт :6003 — прокси ОСНОВНОГО дерева, "
 			"юниты молча пишут в чужую базу. Подними свой стенд: "
-			"bash .zcode/1c/scripts/start_1c_db.sh <корень-дерева> (порт из "
-			"contour.json дерева, :6003 с основным не делить); URL — в "
-			"contour.json дерева (1c_db.url) или env ONEC_DB_URL.")
+			"bash \"$DSH_1C_ROOT/scripts/start_1c_db.sh\" <корень-дерева> "
+			"(порт из contour.json дерева, :6003 с основным не делить); "
+			"URL — в contour.json дерева (1c_db.url) или env ONEC_DB_URL.")
+
+
+def _status_timeout() -> int:
+	"""Потолок сборки состояния (``ONEC_DB_STATUS_TIMEOUT``, дефолт 60 с).
+
+	Сборка — чтение /proc, ss и файлов состояния: секунды. Потолок нужен,
+	чтобы диагностика не держала упавший прогон (канон потолков контура:
+	WAIT_DEADLINE, PROXY_EXECUTE_TIMEOUT).
+	"""
+	raw = os.environ.get("ONEC_DB_STATUS_TIMEOUT", "60")
+	try:
+		value = int(raw)
+	except ValueError:
+		value = 0
+	if value < 1:
+		print(f"onec_db: ONEC_DB_STATUS_TIMEOUT={raw!r} — нужно целое ≥ 1, "
+		      "беру 60 с", file=sys.stderr)
+		return 60
+	return value
+
+
+def _diagnostics(root) -> str:
+	"""Блок состояния стенда из ``start_1c_db.sh --status`` (носитель один).
+
+	Своей сборки плагин не держит: зовётся тот же носитель, что печатает
+	оператору, — процессы с базой, владелец порта, лок 1Cv8.1CL,
+	stand-замок (Usr/Pwd маскирует носитель). Недоступность сборки —
+	названный пробел в тексте ошибки, не исключение: исходная причина
+	недоступности канала важнее.
+	"""
+	head = "диагностика канала (start_1c_db.sh --status):"
+	if root is None:
+		return f"{head}\n  не собрана: корень проекта контура не найден от cwd"
+	try:
+		script = _contour_script("start_1c_db.sh")
+	except RuntimeError as error:
+		return f"{head}\n  не собрана: {error}"
+	try:
+		done = subprocess.run(["bash", str(script), str(root), "--status"],
+		                      capture_output=True, text=True,
+		                      timeout=_status_timeout())
+	except subprocess.TimeoutExpired:
+		return (f"{head}\n  не собрана: --status не уложился в "
+		        f"{_status_timeout()} с")
+	except OSError as error:
+		return f"{head}\n  не собрана: {error}"
+	text = (done.stdout or "").strip()
+	if done.returncode != 0:
+		tail = (done.stderr or "").strip()
+		return (f"{head}\n  не собрана (rc {done.returncode}): "
+		        + (tail[-400:] if tail else "вывод пуст"))
+	return f"{head}\n{text}" if text else \
+		f"{head}\n  пусто: --status ничего не напечатал"
 
 
 @pytest.fixture(scope="session")
@@ -203,7 +338,9 @@ def onec_db() -> OnecDB:
 	except Exception as e:  # noqa: BLE001 — внятный фейл вместо трейса внутри фикстуры
 		raise RuntimeError(
 			"1c-db не отвечает — подними тестовый клиент контура: "
-			"bash .zcode/1c/scripts/start_1c_db.sh (прод-гейт execute_code блокирует)"
+			"bash \"$DSH_1C_ROOT/scripts/start_1c_db.sh\" "
+			"(прод-гейт execute_code блокирует)\n\n"
+			+ _diagnostics(_find_root())
 		) from e
 	_assert_owns_base(client, url)
 	return client
@@ -284,10 +421,11 @@ def _instance_for_channel(root, url: str):
 	channel = _channel_from_url(url)
 	if not channel:
 		return "", ""
-	path = pathlib.Path(root) / ".zcode" / "1c" / "db-instances.yaml"
-	if not path.is_file():
+	path = _layout_input(root, "db-instances.yaml")
+	if path is None:
 		raise RuntimeError(
-			f"onec_db: канал {channel} в url ({url}), но нет {path} — "
+			f"onec_db: канал {channel} в url ({url}), но нет "
+			f"{pathlib.Path(root) / '.dsh' / '1c' / 'db-instances.yaml'} — "
 			"инстанс для восстановления не найти; подними инстанс или "
 			"убери channel из url")
 	entries = {}  # имя → {channel, connection}
@@ -379,14 +517,15 @@ def _solo_base_setup():
 	if root is None:
 		raise RuntimeError(
 			"onec_db: корень проекта контура не найден от cwd "
-			"(нет v8project.yaml и .zcode/1c) — соло-фикстуре не по чему "
+			"(нет v8project.yaml и .dsh/1c) — соло-фикстуре не по чему "
 			"гасить клиентов; запусти прогон из корня дерева")
-	script = pathlib.Path(root) / ".zcode" / "1c" / "scripts" / "start_1c_db.sh"
-	if not script.is_file():
+	try:
+		script = _contour_script("start_1c_db.sh")
+	except RuntimeError as error:
 		raise RuntimeError(
-			f"onec_db: нет {script} — соло-фикстура гасит/поднимает клиента "
-			"скриптом контура; доставь скрипт (маппинг scripts/ контура "
-			"кладёт его в .zcode/1c/scripts) или убери solo_base")
+			f"onec_db: {error} — соло-фикстура гасит/поднимает клиента "
+			"скриптом контура; поставь пакет контура или убери solo_base "
+			"из модуля") from error
 	# Гашение адресуется базой стенда: инстанс — строка соединения своей
 	# записи (база инстанса отлична от привязки дерева по построению
 	# stand-замка «один клиент на файловую базу»), mono — привязка дерева.
@@ -456,8 +595,8 @@ def _solo_base_restore(state):
 	if not _register_client_pid(restore.stdout, state["file"]):
 		# клиент поднят, но финализации он не принадлежит: имени нет
 		print("onec_db: старт не назвал pid клиента — финализация его не "
-		      "гасит; чистку сирот несёт старт контура (Т5 юнита #56, "
-		      "ещё впереди)", file=sys.stderr)
+		      "гасит; сирот снимает старт контура (гигиена старта и "
+		      "--stop --base)", file=sys.stderr)
 
 
 def _alive(pid: int) -> bool:
@@ -550,7 +689,7 @@ def _finalize_clients():
 	for pid in left:
 		print(f"onec_db: pid {pid} пережил финализацию — гаси руками "
 		      "(--stop --base скрипта контура), сирот снимает следующий "
-		      "старт (юнит #56 Т5)", file=sys.stderr)
+		      "старт (гигиена старта)", file=sys.stderr)
 	_SESSION_CLIENTS.clear()
 	return left
 
@@ -558,7 +697,7 @@ def _finalize_clients():
 def pytest_sessionfinish(session, exitstatus):
 	"""Финализация сеанса (юнит #56 Т3): гашение поднятых фикстурами клиентов.
 
-	Перечень — реестр подъёмов фикстур плагина (сегодня —
+	Перечень — реестр подъёмов фикстур плагина (заполняет
 	соло-восстановление; канал-фикстура onec_db процессов не поднимает —
 	ей в реестре нечего носить); перед kill — сверка File= в cmdline,
 	чтобы не гасить чужой процесс под переиспользованным pid. Гасится и
@@ -566,7 +705,7 @@ def pytest_sessionfinish(session, exitstatus):
 	3 тикета падший прогон не называет. Прокси не гасится никогда —
 	общий на проект (решение владельца #37). Граница: kill -9 самого
 	pytest финализацию не выполняет; зомби-прокси и сироты останутся до
-	следующего старта (Т4/Т5 юнита #56 — впереди).
+	следующего старта (автопочинка прокси и гигиена старта).
 	"""
 	_finalize_clients()
 
