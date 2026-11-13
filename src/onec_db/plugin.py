@@ -2,8 +2,9 @@
 уровня логики 1С.
 
 После установки пакета фикстуры доступны во всех тестах без conftest.
-URL 1c-db: env ONEC_DB_URL → .dsh/1c/contour.json (1c_db.url; локальный
-оверлей contour.local.json — фактический порт) → дефолт
+URL 1c-db: env ONEC_DB_URL → contour.json канонной раскладки (`.dsh/1c`,
+затем промежуточная `.dsh`; локальный оверлей contour.local.json —
+фактический порт) → дефолт
 http://127.0.0.1:6003/mcp. Клиент 1c-db поднимает
 ``$DSH_1C_ROOT/scripts/start_1c_db.sh`` пакета контура (проект скрипты не
 вендорит); прод защищён mcp_gate — фикстуры только для тестовых деревьев.
@@ -23,7 +24,7 @@ local-слоя (v8project.local.yaml → v8project.yaml; ``File=`` / ``Srvr+Ref`
 ``e2e_solo`` — run_e2e делит выборку на сеансы по collect-only.
 
 Финализация сеанса (``pytest_sessionfinish``): клиенты, поднятые
-фикстурами плагина за сеанс (сегодня — соло-восстановление), гасятся в
+фикстурами плагина за сеанс (реестр заполняет соло-восстановление), гасятся в
 конце сеанса правилом гашения контура (короткие одиночные kill +
 перепроверка, добивание по pid). Перечень — реестр подъёмов, не
 cmdline-матч по базе: клиент, поднятый не фикстурами плагина (GUI-клиент
@@ -34,7 +35,8 @@ testpilot, ручной старт), финализации не принадл�
 до следующего старта (автопочинка и гигиена старта).
 
 Диагностика канала (``onec_db``): канал не отвечает (в том числе таймаут
-ожидания потребителя 1С) — к ошибке дописывается состояние стенда блоком
+канала — в логе тулкита «Timeout waiting for the 1C consumer») — к ошибке
+дописывается состояние стенда блоком
 ``start_1c_db.sh --status``: процессы с базой в cmdline, владелец порта,
 лок ``1Cv8.1CL``, stand-замок. Usr/Pwd маскирует носитель сборки; своя
 копия сборки в плагине не заводится — блок зовётся у пакета контура.
@@ -113,7 +115,11 @@ def _resolve_url() -> str:
 	if path is not None:
 		try:
 			contour = json.loads(path.read_text(encoding="utf-8"))
-		except (OSError, json.JSONDecodeError):
+		except (OSError, json.JSONDecodeError) as error:
+			# молчаливый фолбэк адресовал бы :6003 основного дерева — тихая
+			# запись в чужую базу; вход называем громко (канон контура)
+			print(f"onec_db: {path}: не разобран ({error}) — url беру по "
+			      "умолчанию, дрейф порта не учтён", file=sys.stderr)
 			contour = {}
 	section = contour.get("1c_db") if isinstance(contour, dict) else None
 	desired = (section.get("url") if isinstance(section, dict) else "") \
@@ -123,7 +129,10 @@ def _resolve_url() -> str:
 	if path is not None:
 		try:
 			local = json.loads(path.read_text(encoding="utf-8"))
-		except (OSError, json.JSONDecodeError):
+		except (OSError, json.JSONDecodeError) as error:
+			print(f"onec_db: {path}: не разобран ({error}) — фактический "
+			      "порт прокси неизвестен, беру url из contour.json",
+			      file=sys.stderr)
 			local = {}
 	layer = local.get("1c_db") if isinstance(local, dict) else None
 	# Локальный слой применяется, пока желаемый url не менялся (дрейф порта
@@ -207,6 +216,16 @@ def _fmt_base(keys: dict) -> str:
 	return ";".join(f"{k}={keys[k]}" for k in _BASE_KEYS if k in keys)
 
 
+def _describe_connection(connection) -> str:
+	"""Строка соединения для текста ошибки: только несущие базу ключи.
+
+	Usr=/Pwd= в вывод плагина не попадают (инвариант контура: креды не
+	печатаются); нечего назвать — печатается факт, а не сама строка.
+	"""
+	base = _fmt_base(_conn_keys(str(connection)))
+	return base or "строка без File=/Srvr+Ref"
+
+
 def _assert_owns_base(client: OnecDB, url: str) -> None:
 	"""Проба принадлежности: база прокси = база дерева, иначе прогон не стартует."""
 	root = _find_root()
@@ -224,7 +243,8 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 	expected = _base_keys(expected_raw, root, resolve_relative=True)
 	if not expected:
 		raise RuntimeError(
-			f"onec_db: в привязке дерева нет File=/Srvr+Ref: {expected_raw!r}")
+			"onec_db: в привязке дерева нет File=/Srvr+Ref: "
+			f"{_describe_connection(expected_raw)}")
 	try:
 		actual_raw = client.execute(_PROBE_CODE)
 	except Exception as e:  # noqa: BLE001 — внятный фейл вместо трейса
@@ -235,7 +255,7 @@ def _assert_owns_base(client: OnecDB, url: str) -> None:
 	if not actual:
 		raise RuntimeError(
 			f"onec_db: прокси {url} не отдал строку соединения, получено: "
-			f"{str(actual_raw)[:200]!r}")
+			f"{_describe_connection(actual_raw)}")
 	if expected != actual:
 		hint = ""
 		actual_file = _conn_keys(str(actual_raw)).get("File")
@@ -263,11 +283,16 @@ def _status_timeout() -> int:
 	чтобы диагностика не держала упавший прогон (канон потолков контура:
 	WAIT_DEADLINE, PROXY_EXECUTE_TIMEOUT).
 	"""
+	raw = os.environ.get("ONEC_DB_STATUS_TIMEOUT", "60")
 	try:
-		value = int(os.environ.get("ONEC_DB_STATUS_TIMEOUT", "60"))
+		value = int(raw)
 	except ValueError:
+		value = 0
+	if value < 1:
+		print(f"onec_db: ONEC_DB_STATUS_TIMEOUT={raw!r} — нужно целое ≥ 1, "
+		      "беру 60 с", file=sys.stderr)
 		return 60
-	return max(1, value)
+	return value
 
 
 def _diagnostics(root) -> str:
@@ -672,7 +697,7 @@ def _finalize_clients():
 def pytest_sessionfinish(session, exitstatus):
 	"""Финализация сеанса (юнит #56 Т3): гашение поднятых фикстурами клиентов.
 
-	Перечень — реестр подъёмов фикстур плагина (сегодня —
+	Перечень — реестр подъёмов фикстур плагина (заполняет
 	соло-восстановление; канал-фикстура onec_db процессов не поднимает —
 	ей в реестре нечего носить); перед kill — сверка File= в cmdline,
 	чтобы не гасить чужой процесс под переиспользованным pid. Гасится и

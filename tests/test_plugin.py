@@ -1,9 +1,11 @@
 """Проба принадлежности базы фикстуры onec_db (ловушка git-ворктри)."""
 import pytest
 
+# Приватные имена плагина импортируются внутри тестов (канон панели Т3):
+# на базовом коммите новых имён нет, и файл обязан собираться — иначе
+# краснеет весь набор, а не проверки переноса раскладки.
 from onec_db.plugin import (_assert_owns_base, _base_keys, _conn_keys,
-                            _contour_script, _expected_connection, _find_root,
-                            _resolve_url)
+                            _expected_connection, _find_root)
 from onec_db.core import OnecDB
 from test_core import FakeMCPHandler
 
@@ -71,6 +73,8 @@ def test_find_root_accepts_canon_layout(tmp_path, monkeypatch):
 
 
 def test_resolve_url_canon_layout_and_local_overlay(tmp_path, monkeypatch):
+	from onec_db.plugin import _resolve_url
+
 	monkeypatch.delenv("ONEC_DB_URL", raising=False)
 	root = tmp_path / "proj"
 	cfg = root / ".dsh" / "1c"
@@ -90,7 +94,25 @@ def test_resolve_url_canon_layout_and_local_overlay(tmp_path, monkeypatch):
 	assert _resolve_url() == "http://127.0.0.1:6007/mcp"
 
 
+def test_resolve_url_names_broken_layer(tmp_path, monkeypatch, capsys):
+	from onec_db.plugin import _resolve_url
+
+	monkeypatch.delenv("ONEC_DB_URL", raising=False)
+	root = tmp_path / "proj"
+	cfg = root / ".dsh" / "1c"
+	cfg.mkdir(parents=True)
+	(cfg / "contour.json").write_text(
+		'{"1c_db": {"url": "http://127.0.0.1:6003/mcp"}}', encoding="utf-8")
+	(cfg / "contour.local.json").write_text("{битый", encoding="utf-8")
+	monkeypatch.chdir(root)
+	assert _resolve_url() == "http://127.0.0.1:6003/mcp"
+	err = capsys.readouterr().err
+	assert "contour.local.json" in err and "не разобран" in err, err
+
+
 def test_resolve_url_env_wins(tmp_path, monkeypatch):
+	from onec_db.plugin import _resolve_url
+
 	monkeypatch.setenv("ONEC_DB_URL", "http://127.0.0.1:7000/mcp")
 	assert _resolve_url() == "http://127.0.0.1:7000/mcp"
 
@@ -98,6 +120,8 @@ def test_resolve_url_env_wins(tmp_path, monkeypatch):
 def test_dead_zcode_layout_is_not_read(tmp_path, monkeypatch):
 	# снятая раскладка ZCode (Т10 контура) не вход: иначе плагин тихо читал бы
 	# contour.json мёртвого каталога и адресовал чужой стенд
+	from onec_db.plugin import _resolve_url
+
 	monkeypatch.delenv("ONEC_DB_URL", raising=False)
 	root = tmp_path / "proj"
 	cfg = root / ".zcode" / "1c"
@@ -110,6 +134,8 @@ def test_dead_zcode_layout_is_not_read(tmp_path, monkeypatch):
 
 
 def test_contour_script_requires_package(tmp_path, monkeypatch):
+	from onec_db.plugin import _contour_script
+
 	monkeypatch.delenv("DSH_1C_ROOT", raising=False)
 	with pytest.raises(RuntimeError, match="DSH_1C_ROOT"):
 		_contour_script("start_1c_db.sh")
@@ -171,6 +197,30 @@ def test_probe_server_base_match_and_mismatch(tmp_path, fake_mcp, monkeypatch):
 	FakeMCPHandler.conn_string = 'Srvr="srv-01";Ref="другая"'
 	with pytest.raises(RuntimeError, match="ЧУЖУЮ базу"):
 		_assert_owns_base(OnecDB(fake_mcp), fake_mcp)
+
+
+def test_probe_does_not_print_credentials_from_binding(tmp_path, fake_mcp,
+                                                       monkeypatch):
+	# привязка дерева без File=/Srvr+Ref, но с учётками: текст ошибки их не несёт
+	root = _project(tmp_path, connection='Usr="u";Pwd="sekret"')
+	monkeypatch.chdir(root)
+	with pytest.raises(RuntimeError) as err:
+		_assert_owns_base(OnecDB(fake_mcp), fake_mcp)
+	text = str(err.value)
+	assert "sekret" not in text and "Pwd=" not in text and "Usr=" not in text
+	assert "строка без File=/Srvr+Ref" in text
+
+
+def test_probe_does_not_print_credentials_from_proxy_answer(tmp_path, fake_mcp,
+                                                           monkeypatch):
+	root = _project(tmp_path)  # привязка с базой и учётками
+	monkeypatch.chdir(root)
+	FakeMCPHandler.conn_string = 'Usr="u";Pwd="sekret"'  # ответ без базы
+	with pytest.raises(RuntimeError) as err:
+		_assert_owns_base(OnecDB(fake_mcp), fake_mcp)
+	text = str(err.value)
+	assert "sekret" not in text and "Pwd=" not in text and "Usr=" not in text
+	assert "строка без File=/Srvr+Ref" in text
 
 
 def test_probe_reports_garbage_proxy_answer(tmp_path, fake_mcp, monkeypatch):

@@ -97,6 +97,11 @@ def run_pytest(root: Path, pkg: Path, url: str, extra_env: dict = None):
 		capture_output=True, text=True, timeout=120, env=env, cwd=root)
 
 
+def block_present(out: str) -> bool:
+	"""Блок сборки в ошибке как есть: каждая непустая строка на месте."""
+	return all(line in out for line in BLOCK.splitlines() if line.strip())
+
+
 def calls(log: Path) -> list:
 	if not log.is_file():
 		return []
@@ -115,11 +120,11 @@ def test_timeout_error_carries_status_block(tmp_path):
 	for label in ("процессы с базой", "порт 6003", "1Cv8.1CL", "stand-замок"):
 		assert label in out, f"в тексте ошибки нет группы «{label}»:\n{out}"
 	assert "Pwd=" not in out and "Usr=" not in out, out
+	assert block_present(out), f"блок сборки не дошёл как есть:\n{out}"
 	assert calls(tmp_path / "calls.log") == [f"{root} --status"], calls(
 		tmp_path / "calls.log")
-	# причина таймаута не подменена сборкой: текст исходной ошибки на месте
-	assert "Connection refused" in out or "connection refused" in out \
-		or "1c-db" in out, out
+	# исходная причина недоступности канала не подменена сборкой
+	assert "Connection refused" in out, out
 
 
 def test_missing_package_names_gap_and_keeps_cause(tmp_path):
@@ -130,6 +135,7 @@ def test_missing_package_names_gap_and_keeps_cause(tmp_path):
 	out = r.stdout + r.stderr
 	assert r.returncode != 0, out
 	assert "1c-db не отвечает" in out, out
+	assert "Connection refused" in out, out
 	assert "не собрана" in out and "DSH_1C_ROOT" in out, out
 	assert "Pwd=" not in out, out
 
@@ -143,7 +149,7 @@ def test_failing_script_adds_rc_and_stderr(tmp_path):
 	assert r.returncode != 0, out
 	assert "не собрана (rc 2)" in out, out
 	assert "db-instances.yaml не разобран" in out, out
-	assert "1c-db не отвечает" in out, out
+	assert "1c-db не отвечает" in out and "Connection refused" in out, out
 
 
 def test_hanging_script_respects_ceiling(tmp_path):
@@ -154,4 +160,17 @@ def test_hanging_script_respects_ceiling(tmp_path):
 	out = r.stdout + r.stderr
 	assert r.returncode != 0, out
 	assert "не уложился" in out and "1 с" in out, out
+	assert "1c-db не отвечает" in out and "Connection refused" in out, out
+
+
+def test_missing_root_names_gap(tmp_path):
+	# проект без корня контура: сборке нечего адресовать — пробел назван,
+	# исходная причина остаётся
+	root = tmp_path / "noproj"
+	root.mkdir()
+	r = run_pytest(root, package(tmp_path), dead_url())
+	out = r.stdout + r.stderr
+	assert r.returncode != 0, out
 	assert "1c-db не отвечает" in out, out
+	assert "корень проекта контура не найден" in out, out
+	assert "Pwd=" not in out, out
