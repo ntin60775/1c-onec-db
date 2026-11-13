@@ -2,7 +2,8 @@
 import pytest
 
 from onec_db.plugin import (_assert_owns_base, _base_keys, _conn_keys,
-                            _expected_connection, _find_root)
+                            _contour_script, _expected_connection, _find_root,
+                            _resolve_url)
 from onec_db.core import OnecDB
 from test_core import FakeMCPHandler
 
@@ -56,6 +57,69 @@ def test_find_root_walks_up(tmp_path, monkeypatch):
 	(tmp_path / "v8project.yaml").write_text("имя: demo\n", encoding="utf-8")
 	monkeypatch.chdir(nested)
 	assert _find_root() == tmp_path
+
+
+# ── раскладка проекта: канон `.dsh/1c` и пакет контура ──
+
+def test_find_root_accepts_canon_layout(tmp_path, monkeypatch):
+	root = tmp_path / "proj"
+	(root / ".dsh" / "1c").mkdir(parents=True)
+	nested = root / "tests" / "e2e"
+	nested.mkdir(parents=True)
+	monkeypatch.chdir(nested)
+	assert _find_root() == root
+
+
+def test_resolve_url_canon_layout_and_local_overlay(tmp_path, monkeypatch):
+	monkeypatch.delenv("ONEC_DB_URL", raising=False)
+	root = tmp_path / "proj"
+	cfg = root / ".dsh" / "1c"
+	cfg.mkdir(parents=True)
+	(cfg / "contour.json").write_text(
+		'{"1c_db": {"url": "http://127.0.0.1:6003/mcp"}}', encoding="utf-8")
+	monkeypatch.chdir(root)
+	assert _resolve_url() == "http://127.0.0.1:6003/mcp"
+	# локальный оверлей порта применяется, пока желаемый url не менялся
+	(cfg / "contour.local.json").write_text(
+		'{"1c_db": {"desired_url": "http://127.0.0.1:6003/mcp",'
+		' "url": "http://127.0.0.1:6004/mcp"}}', encoding="utf-8")
+	assert _resolve_url() == "http://127.0.0.1:6004/mcp"
+	# смена желаемого url в contour.json снимает дрейф
+	(cfg / "contour.json").write_text(
+		'{"1c_db": {"url": "http://127.0.0.1:6007/mcp"}}', encoding="utf-8")
+	assert _resolve_url() == "http://127.0.0.1:6007/mcp"
+
+
+def test_resolve_url_env_wins(tmp_path, monkeypatch):
+	monkeypatch.setenv("ONEC_DB_URL", "http://127.0.0.1:7000/mcp")
+	assert _resolve_url() == "http://127.0.0.1:7000/mcp"
+
+
+def test_dead_zcode_layout_is_not_read(tmp_path, monkeypatch):
+	# снятая раскладка ZCode (Т10 контура) не вход: иначе плагин тихо читал бы
+	# contour.json мёртвого каталога и адресовал чужой стенд
+	monkeypatch.delenv("ONEC_DB_URL", raising=False)
+	root = tmp_path / "proj"
+	cfg = root / ".zcode" / "1c"
+	cfg.mkdir(parents=True)
+	(cfg / "contour.json").write_text(
+		'{"1c_db": {"url": "http://127.0.0.1:6999/mcp"}}', encoding="utf-8")
+	monkeypatch.chdir(root)
+	assert _find_root() is None
+	assert _resolve_url() == "http://127.0.0.1:6003/mcp"
+
+
+def test_contour_script_requires_package(tmp_path, monkeypatch):
+	monkeypatch.delenv("DSH_1C_ROOT", raising=False)
+	with pytest.raises(RuntimeError, match="DSH_1C_ROOT"):
+		_contour_script("start_1c_db.sh")
+	monkeypatch.setenv("DSH_1C_ROOT", str(tmp_path))
+	with pytest.raises(RuntimeError, match="поставь пакет контура"):
+		_contour_script("start_1c_db.sh")
+	script = tmp_path / "scripts" / "start_1c_db.sh"
+	script.parent.mkdir()
+	script.write_text("", encoding="utf-8")
+	assert _contour_script("start_1c_db.sh") == script
 
 
 # ── проба принадлежности ──
